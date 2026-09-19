@@ -31,6 +31,17 @@ configured rate. A claim with no whole token available leaves the head
 task pending and reschedules it to the exact computed refill instant,
 inside the same atomic database critical section; bucket state is shared
 by all workers and survives restarts.
+
+A per-subscription delivery window (persisted in the DB) restricts
+claims to configured weekdays/local-time ranges in an IANA timezone.
+Outside the window a due head task stays pending and is rescheduled in
+the same atomic critical section to the window's exact next opening
+instant (DST-aware, deterministic); workers then move on to other
+subscriptions. The schedule is an absolute persisted UTC epoch, so a
+restart can never release a task before the opening, and wrap-past-
+midnight windows as well as spring-forward/fall-back transitions follow
+the real zone database. The window gate is evaluated before the token
+bucket, so no tokens are spent while closed.
 """
 from __future__ import annotations
 

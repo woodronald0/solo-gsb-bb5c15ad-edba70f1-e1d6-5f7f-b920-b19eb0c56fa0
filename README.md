@@ -9,6 +9,7 @@
 - **签名密钥平滑轮换**：`POST /subscriptions/{id}/rotate-secret` 原子切换订阅密钥；宽限期（0～86400 秒）内每次投递同时携带按新密钥生成的 `X-Webhook-Signature` 与按旧密钥生成的 `X-Webhook-Signature-Previous`，期满后只发新签名；宽限期内重复轮换返回 `409`，轮换状态持久化、重启后保持，重试按每次实际发送时的状态签名
 - **按订阅投递熔断器**：同一订阅连续最终失败达到 `BREAKER_FAILURE_THRESHOLD` 次即原子熔断（`open`），熔断期间事件照常入库但工作器不再领取；冷却 `BREAKER_COOLDOWN_SECONDS` 秒后仅放行最早待投递任务作为唯一 half-open 探针——成功则关闭并清零计数，失败则重新熔断并刷新冷却时间；状态持久化在 SQLite 中，重启后保持
 - **按订阅令牌桶限流**：`PUT /subscriptions/{id}/rate-policy` 为订阅设置持续速率（`rate_per_second`，令牌/秒，支持小数）与突发容量（`burst`，桶容量）；工作器每次认领在同一数据库临界区内惰性补充并原子扣取一个令牌，多工作器（含多进程）不会重复扣用同一令牌。无整令牌时队首任务保持 `pending`，其 `next_attempt_at` 被推到由持久化余额**确定性计算**出的下一令牌可用时刻（`now + (1 − 余额)/rate`），不依赖进程内定时器；被限流订阅会在同一次认领中跳过、转投其它订阅。桶容量、补充速率、余额及余额时间戳全部持久化在 SQLite 中，服务重启与多工作器并发下限流状态一致；令牌仅在队首任务（严格有序）处扣取，故绝不破坏同订阅有序投递。`GET` 查询实时余额与下一令牌时间，`DELETE` 关闭限流（桶在安装/替换策略时重置为满）
+- **按订阅投递时段（delivery window）**：`PUT /subscriptions/{id}/delivery-window` 配置 IANA 时区（如 `Asia/Shanghai` / `America/New_York`）、允许投递的星期（ISO 编号 1=周一 … 7=周日，可多选）与本地起止时间（`HH:MM` 或 `HH:MM:SS`，半开区间 `[start, end)`；结束时间不晚于开始时间即**跨午夜**窗口，如 `22:00-06:00`）。工作器只在开放时段认领该订阅的队首任务；窗口关闭时队首任务保持 `pending`，其 `next_attempt_at` 在原子认领临界区内被**确定性推进到下次开放时刻**（绝对 UTC epoch，按 IANA 时区库从原理上正确处理跨午夜、夏令时春令跳空与秋令重复小时），随后继续认领其它订阅。调度时间与配置均持久化在 SQLite 中，无进程内定时器，**重启不会提前投递**；窗口门控先于令牌桶判定（关闭期间不消耗令牌），并与严格有序、限流、熔断 half-open 探针、退避重试、暂停/恢复链路叠加生效。`GET` 实时返回 `is_open_now` / `next_open_at`（只读现算、不写库），`DELETE` 移除时段（不提前改写既有任务调度）
 - **HMAC 受保护入站接口**：`POST /ingest` 使用 `INGEST_SECRET` 校验 `X-Webhook-Signature`（覆盖时间戳、ID 与原始 JSON），并强制 ±300 秒时间窗
 - **入站幂等与防重放**：已接收的 `X-Webhook-Id` 持久化在 SQLite 中；重复 ID + 相同内容返回首次接收结果且不重复投递，相同 ID 不同内容返回 `409`
 - **事件定时投递**：`POST /events` 支持可选 `deliver_at`（带时区的未来 ISO-8601 时间，如 `2026-09-20T09:00:00Z`；省略或为 `null` 表示立即投递）。计划时间持久化到任务，工作器在到点前绝不认领（无内存定时器，重启同样生效）；同订阅严格按 `task_id` 有序，因此较早的定时任务会阻塞其后的所有任务（包括立即投递的任务），直到该定时任务投递成功、最终失败或被撤销。`GET /events/{id}` 返回每个任务的 `deliver_at`；缺少时区、过去时间、非法格式均返回 `422`
@@ -77,6 +78,13 @@ curl -s -X PUT http://localhost:8000/subscriptions/$SID/rate-policy \
   -H 'Content-Type: application/json' -d '{"rate_per_second": 1, "burst": 1}'
 curl -s http://localhost:8000/subscriptions/$SID/rate-policy
 curl -s -X DELETE http://localhost:8000/subscriptions/$SID/rate-policy -o /dev/null -w '%{http_code}\n'
+
+# 投递时段：仅工作日（周一至周五）纽约时间 09:00-18:00 允许投递
+curl -s -X PUT http://localhost:8000/subscriptions/$SID/delivery-window \
+  -H 'Content-Type: application/json' \
+  -d '{"timezone": "America/New_York", "weekdays": [1,2,3,4,5], "local_start": "09:00", "local_end": "18:00"}'
+curl -s http://localhost:8000/subscriptions/$SID/delivery-window
+curl -s -X DELETE http://localhost:8000/subscriptions/$SID/delivery-window -o /dev/null -w '%{http_code}\n'
 
 # 主题发布：订阅加入主题 → 向主题发布 → 重放返回首次快照（即使成员变化）
 curl -s -X PUT http://localhost:8000/subscriptions/$SID/topics \
@@ -433,7 +441,84 @@ curl -s -X DELETE http://localhost:8000/subscriptions/44a79d7077ce/rate-policy -
 - **校验错误**：`rate_per_second ≤ 0`、`burst < 1`、超出上限均返回 `422`。
 - **订阅视图**：`GET /subscriptions` 与 `GET /subscriptions/{id}` 的每个订阅都带 `rate_per_second` 与 `burst`（未配置时为 `null`）；实时余额请通过专用 `GET …/rate-policy` 查询。
 
-### 10. 持久化主题发布（pub/sub）
+### 10. 按订阅投递时段（delivery window）
+
+为单个订阅设置“只在这些时间投递”的开放时段，窗口外事件照常入库但工作器不认领，并把队首任务确定性地排到下次开放时刻。
+
+```bash
+# 工作日（周一=1 … 周五=5）纽约时间 09:00-18:00 开放
+curl -s -X PUT http://localhost:8000/subscriptions/44a79d7077ce/delivery-window \
+  -H 'Content-Type: application/json' \
+  -d '{"timezone": "America/New_York", "weekdays": [1,2,3,4,5], "local_start": "09:00", "local_end": "18:00"}'
+```
+
+```json
+{
+  "enabled": true,
+  "timezone": "America/New_York",
+  "weekdays": [1, 2, 3, 4, 5],
+  "local_start": "09:00:00",
+  "local_end": "18:00:00",
+  "wraps_past_midnight": false,
+  "is_open_now": false,
+  "next_open_at": "2026-09-21T13:00:00+00:00",
+  "updated_at": "2026-09-19T05:02:32.259284+00:00"
+}
+```
+
+```bash
+# 查询（is_open_now / next_open_at 按查询时刻在 IANA 时区中现算，只读不改库）
+curl -s http://localhost:8000/subscriptions/44a79d7077ce/delivery-window
+
+# 跨午夜窗口：每天 22:00 到次日 06:00 开放（结束不晚于开始即自动按跨午夜处理）
+curl -s -X PUT http://localhost:8000/subscriptions/44a79d7077ce/delivery-window \
+  -H 'Content-Type: application/json' \
+  -d '{"timezone": "Asia/Shanghai", "weekdays": [1,2,3,4,5,6,7], "local_start": "22:00", "local_end": "06:00"}'
+
+# 仅周末（周六=6、周日=7）
+curl -s -X PUT http://localhost:8000/subscriptions/44a79d7077ce/delivery-window \
+  -H 'Content-Type: application/json' \
+  -d '{"timezone": "UTC", "weekdays": [6,7], "local_start": "00:00", "local_end": "23:59:59"}'
+
+# 移除时段（恢复全天可投递）
+curl -s -X DELETE http://localhost:8000/subscriptions/44a79d7077ce/delivery-window -o /dev/null -w '%{http_code}\n'
+# 204
+```
+
+未配置时段时 `GET` 返回 `enabled: false`（其余配置字段为 `null`，`is_open_now` 为 `true` 表示“没有任何限制”）：
+
+```json
+{"enabled": false, "timezone": null, "weekdays": null, "local_start": null,
+ "local_end": null, "wraps_past_midnight": null, "is_open_now": true,
+ "next_open_at": null, "updated_at": null}
+```
+
+请求体与响应字段：
+
+| 字段 | 说明 |
+|------|------|
+| `timezone` | 请求字段：IANA 时区名（如 `Europe/Berlin`、`America/New_York`、`Asia/Shanghai`、`Pacific/Chatham`），星期与起止时间都按此时区的本地挂钟解释；无法识别的时区名返回 `422` |
+| `weekdays` | 请求字段：允许开放的 ISO 星期编号数组，`1`=周一 … `7`=周日；非空、1～7、**不可重复**，顺序任意（响应按升序回显） |
+| `local_start` / `local_end` | 请求字段：本地起止时间，接受 `HH:MM` 或 `HH:MM:SS`（响应统一规范化为 `HH:MM:SS`）；区间为半开 `[start, end)`，秒与分必须在合法范围内 |
+| `wraps_past_midnight` | 响应字段：`local_end <= local_start` 时为 `true`，表示窗口从开始时间跨过午夜直到次日结束时间；如 `22:00-06:00`、`00:00-00:00`（该星期全天开放） |
+| `is_open_now` | 响应字段：按查询时刻在配置时区中现算的开放状态（只读，不写库）；未配置时段时为 `true` |
+| `next_open_at` | 响应字段：当前关闭时，下次开放的最早时刻（ISO 时间，UTC 偏移）；当前开放或未配置时段时为 `null` |
+| `updated_at` | 响应字段：时段安装/替换的时间（ISO 时间）；未配置时为 `null` |
+
+调度行为约定：
+
+- **只在开放时段认领队首**：窗口判定与任务认领、令牌扣减、熔断 half-open 翻转处在**同一个 `BEGIN IMMEDIATE` 数据库临界区**内。开放即正常认领（随后照常扣令牌、发 HTTP）；关闭则队首任务**不被认领**、保持 `pending`，其 `next_attempt_at` 被原子更新为该窗口的**下次开放时刻**，同一次认领调用随即转投其它订阅的到期任务——单个处于关闭时段的订阅不会空占工作器（实现上与限流共用 `deferred_sids` 机制，每次认领对同一订阅至多重调度一次）。
+- **下次开放时刻是确定性的**：它是“当前 epoch 时刻 + 持久化窗口配置”的纯函数，任何工作器（含独立进程）重算结果一致；结果以**绝对 UTC epoch 秒**持久化在任务行，不使用任何进程内定时器。
+- **重启不得提前投递**：窗口外任务的到期时间已经是未来的绝对 UTC 时刻，重启（含崩溃恢复把 `in_progress` 重置为 `pending`）后认领查询的 `next_attempt_at <= now` 条件天然阻止提前投递；只有墙上时钟真正走到开放时刻才会被认领。窗口配置（时区、星期、起止、安装时间）同样持久化，重启后无需任何内存重建。
+- **跨午夜窗口**：`local_end <= local_start`（含 `00:00` 结束）表示从前一个允许星期的 `local_start` 开放、持续到次日 `local_end` 关闭；例如每天 `22:00-06:00`，周五晚的窗口覆盖周六凌晨。`00:00-00:00` 表示该星期从午夜到午夜全天开放。
+- **夏令时正确处理**（基于系统/IANA 时区数据库，容器镜像通过 `tzdata` 包内置完整库）：开放判定永远基于某个绝对时刻在本地时区的**真实挂钟时间**——春令跳空（如纽约 02:00→03:00 不存在的小时）天然不在窗口内；配置的开放时刻恰好落在跳空小时内时，下次开放解析为跳空后的**第一个真实时刻**（挂钟跳过了配置时刻）；落在秋令重复小时内时取**较早的那次**（窗口随第一次经过即开放）；跨午夜窗口若结束时刻在重复小时内，则持续到第二次（真实的）该时刻才关闭。星期/周末跨 DST 的日期推进（如纽约周五晚 → 周一 10:00 EDT）也按真实偏移计算。
+- **与严格有序叠加**：窗口只在订阅的**队首任务**处判定（严格有序约束保证候选恒为队首）；队首被推到下次开放期间，同订阅后续任务（包括立即到期的）与定时任务一样被有序 `NOT EXISTS` 条件阻塞，队首到点放行后顺序自然延续；撤销队首后，下一条任务成为新队首并按同一窗口判定。不同订阅互不影响、继续并行投递。
+- **与限流叠加**：窗口门控**先于**令牌桶——窗口关闭时不扣令牌、也不写令牌余额；开放时认领才消耗令牌。因此“窗口开放但令牌不足”会把队首排到“下一令牌时刻”，“窗口关闭”排到“下次开放时刻”，两者都在同一临界区内确定性推进。
+- **与熔断/暂停/重试叠加**：熔断 open 冷却未到、订阅暂停时任务在进入窗口判定之前即被跳过（调度时间不被窗口逻辑改动）；冷却后的唯一 half-open 探针同样受窗口约束，只在开放时刻被认领。失败退避到期的重试若落在窗口外，会被改排到下次开放时刻（而不是按退避立即重试）；落在开放内则照常重试。
+- **安装/替换/移除不批量改写任务**：与限流策略一致，`PUT` 只持久化新配置（并记录 `updated_at`），`DELETE` 只清空配置列，均**不批量改写**既有任务的 `next_attempt_at`。已被旧窗口推到未来的任务保持其已持久化的到期时间（绝不提前）；到期醒来或工作器再次轮询时按**新窗口**判定，若新窗口已开放则认领，否则改排到新窗口的下次开放。
+- **错误码**：时区名无法识别、星期为空/越界/重复、时间格式非法或超出 `00:00:00-23:59:59`、起止时间相同，均返回 `422` 且不写库；订阅不存在时 `PUT`/`GET`/`DELETE` 均返回 `404`；对未配置时段的订阅调用 `DELETE` 返回 `404`（与限流端点一致）。
+
+### 11. 持久化主题发布（pub/sub）
 
 主题是持久化的订阅分组：先让订阅加入主题，再向主题发布事件，中继会在发布瞬间快照主题成员并为每个成员生成一条普通投递任务。
 
@@ -501,7 +586,7 @@ curl -s -X POST http://localhost:8000/topic-events \
 - **状态与审计**：主题事件的 `event_id` 可直接用于 `GET /events/{id}`（各收件任务的实时状态、尝试历史、`counts`）、`POST /events/{id}/cancel` 以及 `GET /audit/deliveries`；出站投递的请求体即规范化后的 `payload` JSON，并按收件订阅自己的密钥签名。
 - **首次/重放状态码**：首次发布 `201 Created`（`replayed=false`）；精确重放 `200 OK`（`replayed=true`）。
 
-### 11. 投递审计查询
+### 12. 投递审计查询
 
 跨事件、跨订阅的投递任务审计视图，只读、不影响投递行为。
 
@@ -608,6 +693,9 @@ curl -s http://localhost:8000/audit/deliveries/12
 | `PUT` | `/subscriptions/{id}/rate-policy` | 设置/替换按订阅令牌桶限流策略（`rate_per_second` + `burst`，桶重置为满，不存在返回 404） |
 | `GET` | `/subscriptions/{id}/rate-policy` | 查询限流策略与实时桶余额、下一令牌时间（未配置时 `enabled=false`） |
 | `DELETE` | `/subscriptions/{id}/rate-policy` | 关闭按订阅限流（清空桶配置，重复删除或未配置返回 404） |
+| `PUT` | `/subscriptions/{id}/delivery-window` | 设置/替换按订阅投递时段（IANA 时区 + 星期 + 本地起止时间，支持跨午夜，不存在返回 404） |
+| `GET` | `/subscriptions/{id}/delivery-window` | 查询投递时段与实时 `is_open_now` / `next_open_at`（未配置时 `enabled=false`，不存在返回 404） |
+| `DELETE` | `/subscriptions/{id}/delivery-window` | 移除投递时段（不提前改写任务调度；未配置或订阅不存在返回 404） |
 | `PUT` | `/subscriptions/{id}/topics` | 替换订阅的去重主题集合（空列表清空，不存在返回 404） |
 | `GET` | `/subscriptions/{id}/topics` | 查询订阅的当前主题集合（排序去重，不存在返回 404） |
 | `POST` | `/topic-events` | 向主题当前全部订阅者发布事件（单事务快照；精确重放返回首次结果，冲突 409，空主题 422） |
@@ -620,7 +708,7 @@ curl -s http://localhost:8000/audit/deliveries/12
 
 同一 `subscription_id` 下的投递任务按 `tasks.id` 升序（即任务创建顺序）逐条投递，语义如下：
 
-- 较早任务处于 `pending`（含退避等待重试中、以及定时任务等待 `deliver_at` 到点）或 `in_progress`（投递中）时，同订阅的后续任务**不会被任何工作器认领**；定时任务因此会阻塞其后的立即投递任务；
+- 较早任务处于 `pending`（含退避等待重试中、定时任务等待 `deliver_at` 到点，以及投递时段关闭时被排到下次开放的队首任务）或 `in_progress`（投递中）时，同订阅的后续任务**不会被任何工作器认领**；定时任务与窗口外任务因此会阻塞其后的立即投递任务；
 - 较早任务到达终态——`delivered`（成功）、`failed`（重试耗尽后最终失败）或 `cancelled`（随事件撤销）——才放行同订阅的下一条任务；
 - 不同订阅之间没有顺序约束，`WORKER_COUNT` 个工作器可并行投递不同订阅的任务；
 - 约束在认领时基于 SQLite 中的持久化状态判定，因此失败重试、服务重启（含崩溃恢复）后依然有效；
@@ -666,7 +754,8 @@ def is_valid_during_rotation(new_secret: str, old_secret: str, body: bytes, head
 - **密钥轮换**：`subscriptions` 表新增 `previous_secret` 与 `previous_secret_expires_at` 两列（老库由启动迁移自动 `ALTER TABLE` 补齐），二者始终同时设置或同时清空。轮换在连接锁保护的单次提交中原子完成——当前密钥降级为 previous 并写入绝对失效时间，`secret` 列更新为新密钥；`grace_seconds=0` 时直接清空 previous 列。工作器每次认领任务时随连接读出当前密钥状态，构造请求头时按发送时刻判定宽限期是否结束，因此重试、重启后均按当时状态签名；宽限期未结束的再次轮换在判定阶段即被拒绝（409），不产生任何写操作。查询接口只读取失效时间戳推导 `rotating` 标志，密钥明文从不离开持久层进入响应或日志。
 - **投递熔断器**：`subscriptions` 表新增 `breaker_state`、`breaker_consecutive_failures`、`breaker_next_probe_at`、`breaker_probe_task_id` 四列（老库由启动迁移自动补齐，存量订阅初始为 `closed`/0）。任务终态（`delivered`/`failed`）与熔断器记账在 `finish_attempt` 的同一个 SQLite 事务中提交：最终失败使连续失败数加一，达到 `BREAKER_FAILURE_THRESHOLD` 即原子切为 `open` 并写入 `next_probe_at = 失败时刻 + BREAKER_COOLDOWN_SECONDS`；任意成功投递清零计数。认领查询按熔断状态过滤——`open` 且冷却未到的订阅不可认领；冷却到期后首个认领把订阅原子翻为 `half_open` 并把该任务（按订阅有序约束保证即最早待投递任务）登记为唯一探针，`half_open` 期间认领查询只允许探针任务本身通过，故多工作器并发下探针唯一；探针成功则关闭并清零，最终失败则重新 `open` 并以该失败时刻刷新冷却。全部状态持久化，重启（含崩溃恢复）后冷却计时与探针唯一性继续生效。
 - **崩溃恢复**：启动时将残留的 `in_progress` 任务重置为 `pending` 并立即到期；`pending` 任务按原 `next_attempt_at` 继续调度。崩溃恢复把未完成任务重新视为“尚未认领”，因此若其事件在恢复后被撤销，这些任务会随撤销终止；未撤销则照常重新投递。
-- **按订阅令牌桶限流**：`subscriptions` 表新增 `rate_capacity`、`rate_refill_per_second`、`rate_tokens`、`rate_updated_at` 四列（老库由启动迁移自动 `ALTER TABLE` 补齐，存量订阅四列为 `NULL` 即不限流）。令牌补充采用惰性墙钟模型——读取桶时按 `min(capacity, 余额 + (now − updated_at) * rate)` 现算，不需要后台补充协程。令牌的补充、判断、扣减与余额持久化全部内联在认领的同一个 `BEGIN IMMEDIATE` 临界区内，与任务状态翻转、熔断器 half_open 翻转一并提交，因此多工作器（含多进程共享一个 DB 文件）不会重复扣用同一令牌，重启后从持久化的 `rate_tokens`/`rate_updated_at` 继续补充。桶中不足一个整令牌时不领取任务：队首任务保持 `pending`，`next_attempt_at` 被原子改为下一令牌可用时刻 `now + (1 − 余额)/rate`（持久化余额的纯函数，任意工作器重算一致），补充后的余额同事务落库；同一次认领调用会记住已限流的订阅集合（`throttled_sids`），对每个订阅至多重调度一次后跳过并继续寻找其它订阅的任务，既避免无意义地反复推后时间，也保证循环必然终止。由于严格有序约束使候选任务恒为订阅队首，令牌检查只发生在队首，队首等令牌时后续任务本就被 `NOT EXISTS` 阻塞，故限流绝不破坏同订阅有序投递；不同订阅互不影响，被限流期间仍可并行投递。`PUT` 安装/替换策略把余额重置为满（`rate_tokens=capacity, rate_updated_at=now`）但不批量改写任务调度；`DELETE` 清空四列关闭限流；`GET` 的实时余额仅现算展示、不写库。
+- **按订阅令牌桶限流**：`subscriptions` 表新增 `rate_capacity`、`rate_refill_per_second`、`rate_tokens`、`rate_updated_at` 四列（老库由启动迁移自动 `ALTER TABLE` 补齐，存量订阅四列为 `NULL` 即不限流）。令牌补充采用惰性墙钟模型——读取桶时按 `min(capacity, 余额 + (now − updated_at) * rate)` 现算，不需要后台补充协程。令牌的补充、判断、扣减与余额持久化全部内联在认领的同一个 `BEGIN IMMEDIATE` 临界区内，与任务状态翻转、熔断器 half_open 翻转一并提交，因此多工作器（含多进程共享一个 DB 文件）不会重复扣用同一令牌，重启后从持久化的 `rate_tokens`/`rate_updated_at` 继续补充。桶中不足一个整令牌时不领取任务：队首任务保持 `pending`，`next_attempt_at` 被原子改为下一令牌可用时刻 `now + (1 − 余额)/rate`（持久化余额的纯函数，任意工作器重算一致），补充后的余额同事务落库；同一次认领调用会记住已被门控（限流或窗口关闭）的订阅集合（`deferred_sids`），对每个订阅至多重调度一次后跳过并继续寻找其它订阅的任务，既避免无意义地反复推后时间，也保证循环必然终止。由于严格有序约束使候选任务恒为订阅队首，令牌检查只发生在队首，队首等令牌时后续任务本就被 `NOT EXISTS` 阻塞，故限流绝不破坏同订阅有序投递；不同订阅互不影响，被限流期间仍可并行投递。`PUT` 安装/替换策略把余额重置为满（`rate_tokens=capacity, rate_updated_at=now`）但不批量改写任务调度；`DELETE` 清空四列关闭限流；`GET` 的实时余额仅现算展示、不写库。
+- **按订阅投递时段**：新增 `app/delivery_window.py` 纯函数调度模块（`DeliveryWindow` 不可变值对象 + IANA 时区解析），`subscriptions` 表新增 `window_timezone`、`window_weekdays`（排序去重后的 JSON 数组）、`window_local_start`、`window_local_end`（本地午夜后秒数）、`window_updated_at` 五列（新建库直接具备；老库由启动迁移自动 `ALTER TABLE` 补齐，存量订阅五列为 `NULL` 即全天可投递）。时区按 IANA 名经 `zoneinfo.ZoneInfo` 加载并按名缓存；Pydantic 模型在写入前校验时区可解析、星期非空且 1..7 不重复、起止时间可解析且在 `00:00:00-23:59:59`、起止不相等（非法一律 `422` 不写库），接受 `HH:MM`/`HH:MM:SS`、响应规范化为 `HH:MM:SS`；`local_end <= local_start` 即跨午夜窗口（如 `22:00-06:00`、`00:00-00:00` 全天）。开放判定 `is_open(ts)` 把绝对时刻转换为配置时区的真实本地日期/星期/挂钟秒，按“当日允许星期且挂钟在 `[start, end)`（跨午夜时为 `>= start`）”或“跨午夜尾部（前一日为允许星期且挂钟 `< end`）”判定——因始终从真实时刻反推本地挂钟，春令跳空小时不可能落入区间、秋令重复小时随真实时钟经过两次而自然处理。下次开放 `next_open(ts)` 从当天起枚举至多 7 个本地日期中属于允许星期的日子，取不早于 `ts` 的最早开放时刻；开放时刻经 `_open_instant` 解析：普通时刻直接映射，重复小时取 `fold=0`（较早一次），不存在的跳空时刻先经往返比对（`fromtimestamp` 后能否还原同一 naive 本地时间）识别，再对单调不减的本地时间函数二分求出跳空后的第一个真实时刻（搜索跨度 48h，远超地球上任何 DST 跳变）。认领临界区在熔断器/暂停过滤之后、令牌桶之前对候选队首做窗口门控：关闭时一条 `UPDATE tasks` 把队首 `next_attempt_at` 确定性推到 `next_open(now)`（仅对已到期任务前推，未来的计划时间永不被提前），订阅记入 `deferred_sids` 后继续认领其它订阅，全部重调度随事务一次提交；开放则继续进入令牌扣减与认领。调度时间是绝对 UTC epoch 且全程持久化，无进程内定时器，故重启/崩溃恢复后只能在真实开放时刻投递；窗口配置本身同样落库，重启无需重建。`PUT`/`DELETE` 与限流策略一样不批量改写任务行：已排到未来开放时刻的任务保留其持久化时间（绝不因配置变更而提前），醒来时按新配置判定；`GET` 的 `is_open_now`/`next_open_at` 仅现算展示、不写库。容器侧在 `requirements.txt` 增加 `tzdata`，确保 `python:3.12-slim`（无系统 tzdb）内 `zoneinfo` 可解析全部 IANA 时区。
 - **定时投递**：`POST /events` 的可选 `deliver_at` 在 Pydantic 模型层校验——必须是可解析的 ISO-8601 字符串、带显式时区偏移（拒绝无时区的朴素时间与纯日期）、且严格晚于当前时刻，任何不满足均返回 `422` 且不写库；通过后转换为 UTC epoch 秒。`tasks` 表新增 `deliver_at REAL` 列保存该计划时间（立即投递为 `NULL`），并在建任务时用它初始化 `next_attempt_at`，因此“到点前不认领”无需任何进程内定时器，完全由认领查询既有的 `next_attempt_at <= now` 条件保证，服务重启、崩溃恢复后同样成立。等待中的定时任务状态仍是 `pending`，认领查询既有的按订阅有序 `NOT EXISTS` 条件使其自动阻塞同订阅后续所有任务（包括立即到期的任务），直到定时任务本身进入终态；不同订阅照常并行投递。定时任务到点后的投递、失败退避、撤销、暂停恢复、熔断探针等路径与普通任务完全复用，无需特判。老库迁移：经 `cancelled` 表重建升级的最老库在重建时直接带上 `deliver_at` 列；已有 `cancelled_at` 但缺少该列的较新库通过 `ALTER TABLE tasks ADD COLUMN deliver_at REAL` 补齐，存量任务取值 `NULL`（即立即投递语义）。
 - **事件级撤销**：`tasks.status` 增加终态 `cancelled` 并新增 `cancelled_at` 列（新建库直接具备；老库启动迁移时按 SQLite 官方表重建流程——`foreign_keys=OFF`、单个显式事务内建新表、拷贝数据、DROP、RENAME、重建 `tasks` 上的两个索引——自动升级，既有任务数据原样保留）。`POST /events/{id}/cancel` 调用的 `cancel_event` 在连接锁保护的单个事务中执行：事件不存在直接返回 `None`（API 返回 `404`）；否则一条 `UPDATE ... WHERE event_id=? AND status='pending'` 原子地只撤销尚未认领的任务（写入 `cancelled_at`、清空 `next_attempt_at`/`claimed_by`），`in_progress` 与已结束任务不在 WHERE 命中范围内、结果不变；随后按状态 `GROUP BY` 计数返回。由于认领查询只选 `pending` 且有序约束只盯 `pending`/`in_progress`，撤销行既不会被重试、也不会阻塞同订阅后续任务；撤销从不经过 `finish_attempt`，故完全不触碰熔断器记账。唯一需要修复的边角是 half-open 探针在两次尝试之间回到 `pending` 时被撤销：同一事务内把该订阅熔断器从 `half_open` 转回 `open`、探针立即到期并清空探针归属，使下一个待投递任务成为替代探针，避免订阅永久卡在 half-open。重复撤销时 UPDATE 命中 0 行，响应 `cancelled=0` 且计数稳定，天然幂等；撤销与工作器认领共用同一把连接锁，并发下每个任务只可能“被认领（投递并记账）”或“被撤销”，不会重复领取也不会状态错乱。
 - **退避策略**：第 n 次失败后延迟 `2^(n-1)` 秒（1、2、4），第 4 次失败后任务终止，结果为 `failed`。
@@ -688,18 +777,20 @@ def is_valid_during_rotation(new_secret: str, old_secret: str, body: bytes, head
 | `BREAKER_FAILURE_THRESHOLD` | `5` | 触发订阅熔断的连续最终失败任务数 |
 | `BREAKER_COOLDOWN_SECONDS` | `30` | 熔断冷却时间（到期后放行唯一 half-open 探针） |
 | *按订阅限流* | 未启用（默认不限流） | 限流**不使用环境变量**，逐订阅通过 `PUT /subscriptions/{id}/rate-policy` 配置（`rate_per_second` / `burst`），策略与令牌余额持久化在数据库中 |
+| *按订阅投递时段* | 未启用（默认全天可投递） | 投递时段**不使用环境变量**，逐订阅通过 `PUT /subscriptions/{id}/delivery-window` 配置（IANA 时区 + 星期 + 本地起止时间），配置与调度状态持久化在数据库中 |
 | `POLL_INTERVAL_SECONDS` | `0.2` | 空闲工作器轮询间隔 |
 
 ## 项目结构
 
 ```
 app/
-├── main.py      # FastAPI 应用：API 端点 + 生命周期（启动/停止工作器）
-├── worker.py    # 投递工作器：认领任务、HTTP 投递、记录结果
-├── db.py        # SQLite 持久层：建表、原子认领、状态更新
-├── schemas.py   # Pydantic 请求/响应模型
-├── signing.py   # HMAC-SHA256 签名与验签
-└── config.py    # 环境变量配置
+├── main.py            # FastAPI 应用：API 端点 + 生命周期（启动/停止工作器）
+├── worker.py          # 投递工作器：认领任务、HTTP 投递、记录结果
+├── db.py              # SQLite 持久层：建表、原子认领、状态更新
+├── delivery_window.py # 投递时段：IANA 时区、星期窗口、DST 安全的确定性调度
+├── schemas.py         # Pydantic 请求/响应模型
+├── signing.py         # HMAC-SHA256 签名与验签
+└── config.py          # 环境变量配置
 Dockerfile
 docker-compose.yml
 requirements.txt

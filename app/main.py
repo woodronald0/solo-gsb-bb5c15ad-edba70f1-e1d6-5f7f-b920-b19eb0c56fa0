@@ -16,10 +16,13 @@ from pydantic import ValidationError
 
 from . import config, signing
 from .db import Database
+from .delivery_window import DeliveryWindow, format_clock, parse_clock
 from .schemas import (
     DeliveryStatus,
     DeliveryTaskDetail,
     DeliveryTaskPage,
+    DeliveryWindowCreate,
+    DeliveryWindowOut,
     EventAccepted,
     EventCancelResult,
     EventCreate,
@@ -134,6 +137,44 @@ def _rate_policy_out(policy: dict) -> dict:
         "burst": policy["burst"] if enabled else None,
         "tokens_available": round(policy["tokens_available"], 6) if enabled else None,
         "next_token_at": _iso(policy["next_token_at"]),
+    }
+
+
+def _delivery_window_out(now: float, policy: dict) -> dict:
+    """Serialize a delivery-window row (from db.get_delivery_window) for the API.
+
+    The live is_open_now/next_open_at fields are evaluated here from the
+    stored configuration against the supplied 'now' epoch; they never write
+    back. next_open_at is reported only while the window is currently
+    closed.
+    """
+    if not policy["configured"]:
+        return {
+            "enabled": False,
+            "timezone": None,
+            "weekdays": None,
+            "local_start": None,
+            "local_end": None,
+            "wraps_past_midnight": None,
+            "is_open_now": True,  # no window configured: nothing is restricted
+            "next_open_at": None,
+            "updated_at": None,
+        }
+    window = DeliveryWindow(
+        policy["timezone"], tuple(policy["weekdays"]),
+        policy["local_start"], policy["local_end"],
+    )
+    is_open = window.is_open(now)
+    return {
+        "enabled": True,
+        "timezone": policy["timezone"],
+        "weekdays": list(policy["weekdays"]),
+        "local_start": format_clock(policy["local_start"]),
+        "local_end": format_clock(policy["local_end"]),
+        "wraps_past_midnight": window.wraps_past_midnight,
+        "is_open_now": is_open,
+        "next_open_at": _iso(window.next_open(now)) if not is_open else None,
+        "updated_at": _iso(policy["updated_at"]),
     }
 
 
@@ -296,6 +337,59 @@ def get_rate_policy(sub_id: str) -> dict:
 def delete_rate_policy(sub_id: str) -> Response:
     """Remove a subscription's rate policy (rate limiting disabled)."""
     if not app.state.db.delete_rate_policy(sub_id):
+        raise HTTPException(404, f"subscription {sub_id!r} not found")
+    return Response(status_code=204)
+
+
+@app.put("/subscriptions/{sub_id}/delivery-window", response_model=DeliveryWindowOut)
+def put_delivery_window(sub_id: str, body: DeliveryWindowCreate) -> dict:
+    """Install or replace a subscription's delivery window.
+
+    The window names an IANA timezone, the weekdays (1=Mon..7=Sun) on which
+    it opens, and local start/end wall-clock times; an end at or before the
+    start denotes a window that wraps past midnight. While the window is
+    closed the worker does not claim the subscription's head task: inside
+    the same atomic claim critical section it deterministically pushes
+    next_attempt_at to the window's next opening instant (DST-aware,
+    persisted as an absolute UTC epoch) and keeps processing other
+    subscriptions. Nothing is delivered early across a restart because the
+    gate and the schedule live entirely in persisted state. Installing a
+    window never rewrites task rows; pending tasks meet the new window on
+    their next claim attempt.
+    """
+    start = parse_clock(body.local_start)
+    end = parse_clock(body.local_end)
+    stored = app.state.db.set_delivery_window(
+        sub_id, body.timezone, body.weekdays, start, end
+    )
+    if stored is None:
+        raise HTTPException(404, f"subscription {sub_id!r} not found")
+    policy = app.state.db.get_delivery_window(sub_id)
+    log.info(
+        "subscription %s delivery window set: zone=%s weekdays=%s %s-%s",
+        sub_id, body.timezone, body.weekdays, body.local_start, body.local_end,
+    )
+    return _delivery_window_out(time.time(), policy)
+
+
+@app.get("/subscriptions/{sub_id}/delivery-window", response_model=DeliveryWindowOut)
+def get_delivery_window(sub_id: str) -> dict:
+    """Return the subscription's window and its live open state.
+
+    A subscription without a window answers enabled=false. is_open_now and
+    next_open_at are computed from the IANA zone at the query instant; a
+    GET never persists scheduling state.
+    """
+    policy = app.state.db.get_delivery_window(sub_id)
+    if policy is None:
+        raise HTTPException(404, f"subscription {sub_id!r} not found")
+    return _delivery_window_out(time.time(), policy)
+
+
+@app.delete("/subscriptions/{sub_id}/delivery-window", status_code=204)
+def delete_delivery_window(sub_id: str) -> Response:
+    """Remove a subscription's delivery window (deliveries unrestricted)."""
+    if not app.state.db.delete_delivery_window(sub_id):
         raise HTTPException(404, f"subscription {sub_id!r} not found")
     return Response(status_code=204)
 

@@ -13,6 +13,8 @@ import time
 import uuid
 from contextlib import contextmanager
 
+from .delivery_window import DeliveryWindow, get_zone
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS subscriptions (
     id          TEXT PRIMARY KEY,
@@ -30,7 +32,12 @@ CREATE TABLE IF NOT EXISTS subscriptions (
     rate_capacity          REAL,        -- token-bucket size (max burst); NULL = rate limiting off
     rate_refill_per_second REAL,        -- tokens added per second (sustained delivery rate)
     rate_tokens            REAL,        -- persisted balance; refilled lazily by wall clock
-    rate_updated_at        REAL         -- epoch seconds the balance was last persisted
+    rate_updated_at        REAL,        -- epoch seconds the balance was last persisted
+    window_timezone        TEXT,        -- delivery window: IANA zone; NULL when no window configured
+    window_weekdays        TEXT,        -- delivery window: JSON array of ISO weekdays 1..7
+    window_local_start     INTEGER,     -- delivery window: local seconds after midnight
+    window_local_end       INTEGER,     -- delivery window: local seconds; <= start = wraps midnight
+    window_updated_at      REAL         -- epoch seconds the window was last installed/replaced
 );
 
 CREATE TABLE IF NOT EXISTS events (
@@ -102,7 +109,9 @@ CREATE INDEX IF NOT EXISTS idx_subscription_topics_topic ON subscription_topics 
 _SUB_COLUMNS = (
     "id, target_url, created_at, paused_at, previous_secret_expires_at, "
     "breaker_state, breaker_consecutive_failures, breaker_next_probe_at, "
-    "rate_capacity, rate_refill_per_second, rate_tokens, rate_updated_at"
+    "rate_capacity, rate_refill_per_second, rate_tokens, rate_updated_at, "
+    "window_timezone, window_weekdays, window_local_start, window_local_end, "
+    "window_updated_at"
 )
 
 # Token accounting tolerance; avoids rescheduling by microseconds due to
@@ -130,6 +139,28 @@ def _refill_tokens(
         return tokens, updated_at
     balance = min(capacity, tokens + (now - updated_at) * refill_per_second)
     return balance, now
+
+
+def _window_from_row(row) -> DeliveryWindow | None:
+    """Build the immutable DeliveryWindow described by a subscription row.
+
+    Returns None when no window is configured (any window column NULL).
+    A row whose stored configuration cannot be interpreted (e.g. a tzdb that
+    lost the zone) is treated as 'no window' rather than wedging claiming;
+    configuration is validated when written, so this only guards corruption.
+    """
+    tz = row["window_timezone"]
+    raw_weekdays = row["window_weekdays"]
+    start = row["window_local_start"]
+    end = row["window_local_end"]
+    if tz is None or raw_weekdays is None or start is None or end is None:
+        return None
+    try:
+        weekdays = tuple(sorted(json.loads(raw_weekdays)))
+        get_zone(tz)  # fail fast if the zone database cannot resolve it
+        return DeliveryWindow(tz, weekdays, int(start), int(end))
+    except (ValueError, TypeError, json.JSONDecodeError):
+        return None
 
 
 class Database:
@@ -226,6 +257,26 @@ class Database:
         if "rate_updated_at" not in cols:
             self._conn.execute(
                 "ALTER TABLE subscriptions ADD COLUMN rate_updated_at REAL"
+            )
+        if "window_timezone" not in cols:
+            self._conn.execute(
+                "ALTER TABLE subscriptions ADD COLUMN window_timezone TEXT"
+            )
+        if "window_weekdays" not in cols:
+            self._conn.execute(
+                "ALTER TABLE subscriptions ADD COLUMN window_weekdays TEXT"
+            )
+        if "window_local_start" not in cols:
+            self._conn.execute(
+                "ALTER TABLE subscriptions ADD COLUMN window_local_start INTEGER"
+            )
+        if "window_local_end" not in cols:
+            self._conn.execute(
+                "ALTER TABLE subscriptions ADD COLUMN window_local_end INTEGER"
+            )
+        if "window_updated_at" not in cols:
+            self._conn.execute(
+                "ALTER TABLE subscriptions ADD COLUMN window_updated_at REAL"
             )
 
         task_cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(tasks)")}
@@ -328,6 +379,11 @@ class Database:
             "rate_refill_per_second": None,
             "rate_tokens": None,
             "rate_updated_at": None,
+            "window_timezone": None,
+            "window_weekdays": None,
+            "window_local_start": None,
+            "window_local_end": None,
+            "window_updated_at": None,
         }
 
     def list_subscriptions(self) -> list[dict]:
@@ -514,6 +570,108 @@ class Database:
                       SET rate_capacity = NULL, rate_refill_per_second = NULL,
                           rate_tokens = NULL, rate_updated_at = NULL
                     WHERE id = ? AND rate_capacity IS NOT NULL""",
+                (sub_id,),
+            )
+        return cur.rowcount > 0
+
+    # ------------------------------------------------------------------
+    # per-subscription delivery-window policy
+    # ------------------------------------------------------------------
+    def set_delivery_window(
+        self,
+        sub_id: str,
+        timezone: str,
+        weekdays: list[int],
+        local_start: int,
+        local_end: int,
+    ) -> dict | None:
+        """Install/replace a subscription's delivery window, atomically.
+
+        The configuration is validated by the API layer (real IANA zone,
+        non-empty deduplicated weekday set, in-range distinct clock times);
+        here it is persisted verbatim with an installation timestamp. Task
+        rows are never rewritten: like the rate policy, pending tasks simply
+        meet the new window on their next claim attempt -- a due head task
+        found outside the window is deterministically pushed to the next
+        opening inside the claim's critical section, and a task scheduled
+        further out is judged by the new window when it wakes. Returns the
+        stored window row fields, or None when the subscription does not
+        exist.
+        """
+        now = time.time()
+        ordered = sorted(set(weekdays))
+        encoded = json.dumps(ordered, separators=(",", ":"))
+        with self._lock, self._immediate():
+            row = self._conn.execute(
+                "SELECT 1 FROM subscriptions WHERE id = ?", (sub_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            self._conn.execute(
+                """UPDATE subscriptions
+                      SET window_timezone = ?, window_weekdays = ?,
+                          window_local_start = ?, window_local_end = ?,
+                          window_updated_at = ?
+                    WHERE id = ?""",
+                (timezone, encoded, local_start, local_end, now, sub_id),
+            )
+        return {
+            "timezone": timezone,
+            "weekdays": ordered,
+            "local_start": local_start,
+            "local_end": local_end,
+            "updated_at": now,
+        }
+
+    def get_delivery_window(self, sub_id: str) -> dict | None:
+        """Return a subscription's stored delivery-window configuration.
+
+        Returns None when the subscription does not exist. A subscription
+        without a window returns a dict whose 'configured' flag is False and
+        whose other fields are None.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT window_timezone, window_weekdays, window_local_start,
+                          window_local_end, window_updated_at
+                     FROM subscriptions WHERE id = ?""",
+                (sub_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        if row["window_timezone"] is None:
+            return {
+                "configured": False,
+                "timezone": None,
+                "weekdays": None,
+                "local_start": None,
+                "local_end": None,
+                "updated_at": None,
+            }
+        return {
+            "configured": True,
+            "timezone": row["window_timezone"],
+            "weekdays": json.loads(row["window_weekdays"]),
+            "local_start": row["window_local_start"],
+            "local_end": row["window_local_end"],
+            "updated_at": row["window_updated_at"],
+        }
+
+    def delete_delivery_window(self, sub_id: str) -> bool:
+        """Remove a subscription's delivery window (deliveries unrestricted).
+
+        The window columns are cleared; task rows are not touched, so tasks
+        previously pushed to a future opening simply wake as scheduled and
+        then claim without a window check. Returns False when the
+        subscription does not exist or had no window configured.
+        """
+        with self._lock, self._immediate():
+            cur = self._conn.execute(
+                """UPDATE subscriptions
+                      SET window_timezone = NULL, window_weekdays = NULL,
+                          window_local_start = NULL, window_local_end = NULL,
+                          window_updated_at = NULL
+                    WHERE id = ? AND window_timezone IS NOT NULL""",
                 (sub_id,),
             )
         return cur.rowcount > 0
@@ -913,9 +1071,27 @@ class Database:
         other subscriptions, so one throttled subscription never parks an
         idle worker. A subscription found throttled during this call is
         skipped for the rest of the same call (it is recorded in
-        throttled_sids): its head task was pushed to its refill instant
+        deferred_sids): its head task was pushed to its refill instant
         once, and considering it again would only push that instant out
         further while examining tasks that are blocked behind it anyway.
+
+        Per-subscription delivery window: when a subscription has a window
+        (window_timezone / window_weekdays / window_local_start /
+        window_local_end set), the due head task is admitted only while the
+        window is open in the configured IANA zone. The check is a pure
+        function of epoch time and the persisted configuration (see
+        delivery_window.DeliveryWindow), so every worker reaches the same
+        verdict and the rule survives restarts with no in-memory timers.
+        Outside the window the task is NOT claimed: it stays 'pending' and
+        its next_attempt_at is pushed to the window's exact next opening
+        instant (DST-aware, deterministic); cross-midnight wrap windows and
+        spring-forward/fall-back transitions are handled from the real tzdb.
+        Only due tasks are pushed forward (a future next_attempt_at is
+        never moved earlier), so restarts can never deliver early. Like a
+        throttled subscription, a closed-window subscription is deferred
+        once per call (deferred_sids) and the loop claims due work of other
+        subscriptions instead. The window gate runs before the token gate,
+        so waiting outside a window neither spends nor refills tokens.
         """
         with self._lock:
             # Take the database-wide write lock up front (BEGIN IMMEDIATE)
@@ -926,17 +1102,21 @@ class Database:
             self._conn.execute("BEGIN IMMEDIATE")
             dirty = False
             try:
-                # Reschedule each throttled subscription at most once per
-                # call; the membership check also makes the loop provably
-                # terminate (it never revisits a subscription it deferred).
-                throttled_sids: set[str] = set()
+                # Defer each gated (closed-window or throttled) subscription
+                # at most once per call; the membership check also makes the
+                # loop provably terminate (it never revisits a subscription
+                # it deferred).
+                deferred_sids: set[str] = set()
                 while True:
-                    skip = ",".join("?" * len(throttled_sids)) if throttled_sids else "SELECT NULL WHERE 0"
+                    skip = ",".join("?" * len(deferred_sids)) if deferred_sids else "SELECT NULL WHERE 0"
                     row = self._conn.execute(
                         f"""SELECT t.*, s.target_url, s.secret, s.previous_secret,
                                   s.previous_secret_expires_at, s.breaker_state,
                                   s.rate_capacity, s.rate_refill_per_second,
-                                  s.rate_tokens, s.rate_updated_at, e.payload
+                                  s.rate_tokens, s.rate_updated_at,
+                                  s.window_timezone, s.window_weekdays,
+                                  s.window_local_start, s.window_local_end,
+                                  e.payload
                            FROM tasks t
                            LEFT JOIN subscriptions s ON s.id = t.subscription_id
                            LEFT JOIN events e ON e.id = t.event_id
@@ -958,14 +1138,36 @@ class Database:
                                  )
                            ORDER BY t.next_attempt_at, t.id
                            LIMIT 1""",
-                        (now, *throttled_sids, now) if throttled_sids else (now, now),
+                        (now, *deferred_sids, now) if deferred_sids else (now, now),
                     ).fetchone()
                     if row is None:
                         if dirty:
-                            self._conn.commit()  # persist throttled reschedules only
+                            self._conn.commit()  # persist gated reschedules only
                         else:
                             self._conn.execute("ROLLBACK")  # idle poll: no fsync
                         return None
+
+                    # Delivery-window gate (before tokens): a due head task
+                    # outside the window stays pending until its exact next
+                    # opening -- an absolute UTC epoch, deterministic for all
+                    # workers and across restarts.
+                    window = _window_from_row(row)
+                    if window is not None and row["target_url"] is not None:
+                        if not window.is_open(now):
+                            next_opening = window.next_open(now)
+                            self._conn.execute(
+                                """UPDATE tasks
+                                      SET next_attempt_at = ?, updated_at = ?
+                                    WHERE id = ? AND status = 'pending'""",
+                                (next_opening, now, row["id"]),
+                            )
+                            # The deferred head task blocks only its own
+                            # subscription; remember it and re-query for work
+                            # of other subscriptions. The reschedule commits
+                            # once the claim transaction leaves the loop.
+                            deferred_sids.add(row["subscription_id"])
+                            dirty = True
+                            continue
 
                     capacity = row["rate_capacity"]
                     refill = row["rate_refill_per_second"]
@@ -1002,7 +1204,7 @@ class Database:
                             # subscription; remember it and re-query for work of
                             # other subscriptions. The reschedule commits once
                             # the claim transaction leaves the loop.
-                            throttled_sids.add(row["subscription_id"])
+                            deferred_sids.add(row["subscription_id"])
                             dirty = True
                             continue
                         # Atomically spend one token together with the claim.

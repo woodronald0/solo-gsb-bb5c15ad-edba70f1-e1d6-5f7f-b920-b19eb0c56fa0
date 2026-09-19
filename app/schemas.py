@@ -4,7 +4,9 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+from .delivery_window import MAX_WEEKDAY, MIN_WEEKDAY, get_zone, parse_clock
 
 # The five states a delivery task can be in; also the legal values of the
 # status filter on GET /audit/deliveries.
@@ -76,6 +78,79 @@ class RatePolicyOut(BaseModel):
     burst: float | None
     tokens_available: float | None
     next_token_at: str | None
+
+
+class DeliveryWindowCreate(BaseModel):
+    """Body of PUT /subscriptions/{id}/delivery-window.
+
+    timezone is an IANA zone name (e.g. 'Europe/Berlin',
+    'America/New_York') in which weekdays and local times are interpreted.
+    weekdays uses ISO numbering (1 = Monday ... 7 = Sunday) and must be a
+    non-empty list of distinct days. local_start/local_end are local wall
+    clock times in HH:MM or HH:MM:SS form; the window is the half-open
+    interval [local_start, local_end). A window whose end is not later than
+    its start wraps past midnight (e.g. 22:00-06:00); equal start and end
+    is rejected. Daylight-saving transitions follow the real IANA database.
+    """
+
+    timezone: str = Field(min_length=1, max_length=64)
+    weekdays: list[int] = Field(min_length=1, max_length=7)
+    local_start: str = Field(min_length=5, max_length=8)
+    local_end: str = Field(min_length=5, max_length=8)
+
+    @field_validator("timezone")
+    @classmethod
+    def _valid_zone(cls, v: str) -> str:
+        name = v.strip()
+        get_zone(name)  # raises ValueError (-> 422) for unknown IANA names
+        return name
+
+    @field_validator("weekdays")
+    @classmethod
+    def _valid_weekdays(cls, values: list[int]) -> list[int]:
+        if any(isinstance(v, bool) or not isinstance(v, int) for v in values):
+            raise ValueError("weekdays must be integers")
+        if any(v < MIN_WEEKDAY or v > MAX_WEEKDAY for v in values):
+            raise ValueError("weekdays must be between 1 (Monday) and 7 (Sunday)")
+        if len(set(values)) != len(values):
+            raise ValueError("weekdays must not contain duplicates")
+        return values
+
+    @field_validator("local_start", "local_end")
+    @classmethod
+    def _valid_clock(cls, v: str) -> str:
+        parse_clock(v)  # raises ValueError (-> 422) on bad format/range
+        return v.strip()
+
+    @model_validator(mode="after")
+    def _start_end_distinct(self) -> "DeliveryWindowCreate":
+        if parse_clock(self.local_start) == parse_clock(self.local_end):
+            raise ValueError(
+                "local_start and local_end must differ; a window ending at "
+                "00:00:00 (or earlier than its start) wraps past midnight"
+            )
+        return self
+
+
+class DeliveryWindowOut(BaseModel):
+    """Response of GET/PUT /subscriptions/{id}/delivery-window.
+
+    enabled is False (with the configuration fields null) only when no
+    window is configured. Times are echoed canonically as HH:MM:SS.
+    is_open_now and next_open_at are computed live from the IANA zone at
+    the response instant (the stored configuration itself is never
+    rewritten by a query); next_open_at is null while the window is open.
+    """
+
+    enabled: bool
+    timezone: str | None
+    weekdays: list[int] | None
+    local_start: str | None
+    local_end: str | None
+    wraps_past_midnight: bool | None
+    is_open_now: bool
+    next_open_at: str | None
+    updated_at: str | None
 
 
 class SecretRotationCreate(BaseModel):
