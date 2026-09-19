@@ -9,6 +9,7 @@
 - **签名密钥平滑轮换**：`POST /subscriptions/{id}/rotate-secret` 原子切换订阅密钥；宽限期（0～86400 秒）内每次投递同时携带按新密钥生成的 `X-Webhook-Signature` 与按旧密钥生成的 `X-Webhook-Signature-Previous`，期满后只发新签名；宽限期内重复轮换返回 `409`，轮换状态持久化、重启后保持，重试按每次实际发送时的状态签名
 - **按订阅投递熔断器**：同一订阅连续最终失败达到 `BREAKER_FAILURE_THRESHOLD` 次即原子熔断（`open`），熔断期间事件照常入库但工作器不再领取；冷却 `BREAKER_COOLDOWN_SECONDS` 秒后仅放行最早待投递任务作为唯一 half-open 探针——成功则关闭并清零计数，失败则重新熔断并刷新冷却时间；状态持久化在 SQLite 中，重启后保持
 - **按订阅令牌桶限流**：`PUT /subscriptions/{id}/rate-policy` 为订阅设置持续速率（`rate_per_second`，令牌/秒，支持小数）与突发容量（`burst`，桶容量）；工作器每次认领在同一数据库临界区内惰性补充并原子扣取一个令牌，多工作器（含多进程）不会重复扣用同一令牌。无整令牌时队首任务保持 `pending`，其 `next_attempt_at` 被推到由持久化余额**确定性计算**出的下一令牌可用时刻（`now + (1 − 余额)/rate`），不依赖进程内定时器；被限流订阅会在同一次认领中跳过、转投其它订阅。桶容量、补充速率、余额及余额时间戳全部持久化在 SQLite 中，服务重启与多工作器并发下限流状态一致；令牌仅在队首任务（严格有序）处扣取，故绝不破坏同订阅有序投递。`GET` 查询实时余额与下一令牌时间，`DELETE` 关闭限流（桶在安装/替换策略时重置为满）
+- **按订阅投递时段**：`PUT /subscriptions/{id}/delivery-window` 为订阅配置投递时段——IANA 时区、允许星期（ISO 1–7）与本地起止时间（支持跨午夜，如 `22:00`–`06:00`）；工作器仅在时段开放时认领该订阅的队首任务，时段外队首任务保持 `pending`，其 `next_attempt_at` 被**确定性**推进到下次开放时刻（持久化配置的纯函数，经 zoneinfo 正确处理夏令时跳变），并在同一次认领中跳过、继续处理其它订阅。配置与调度状态全部持久化在 SQLite 中，重启后不会提前投递；与严格有序、限流、熔断、重试链路完全叠加。`GET` 查询当前配置与实时开放状态，`DELETE` 恢复全时段投递
 - **HMAC 受保护入站接口**：`POST /ingest` 使用 `INGEST_SECRET` 校验 `X-Webhook-Signature`（覆盖时间戳、ID 与原始 JSON），并强制 ±300 秒时间窗
 - **入站幂等与防重放**：已接收的 `X-Webhook-Id` 持久化在 SQLite 中；重复 ID + 相同内容返回首次接收结果且不重复投递，相同 ID 不同内容返回 `409`
 - **事件定时投递**：`POST /events` 支持可选 `deliver_at`（带时区的未来 ISO-8601 时间，如 `2026-09-20T09:00:00Z`；省略或为 `null` 表示立即投递）。计划时间持久化到任务，工作器在到点前绝不认领（无内存定时器，重启同样生效）；同订阅严格按 `task_id` 有序，因此较早的定时任务会阻塞其后的所有任务（包括立即投递的任务），直到该定时任务投递成功、最终失败或被撤销。`GET /events/{id}` 返回每个任务的 `deliver_at`；缺少时区、过去时间、非法格式均返回 `422`
@@ -78,6 +79,13 @@ curl -s -X PUT http://localhost:8000/subscriptions/$SID/rate-policy \
 curl -s http://localhost:8000/subscriptions/$SID/rate-policy
 curl -s -X DELETE http://localhost:8000/subscriptions/$SID/rate-policy -o /dev/null -w '%{http_code}\n'
 
+# 投递时段：工作日 09:00-18:00（Asia/Shanghai）才投递；查看开放状态；恢复全时段
+curl -s -X PUT http://localhost:8000/subscriptions/$SID/delivery-window \
+  -H 'Content-Type: application/json' \
+  -d '{"timezone": "Asia/Shanghai", "days": [1,2,3,4,5], "start": "09:00", "end": "18:00"}'
+curl -s http://localhost:8000/subscriptions/$SID/delivery-window
+curl -s -X DELETE http://localhost:8000/subscriptions/$SID/delivery-window -o /dev/null -w '%{http_code}\n'
+
 # 主题发布：订阅加入主题 → 向主题发布 → 重放返回首次快照（即使成员变化）
 curl -s -X PUT http://localhost:8000/subscriptions/$SID/topics \
   -H 'Content-Type: application/json' -d '{"topics": ["orders", "billing"]}'
@@ -98,7 +106,7 @@ curl -s -X POST http://localhost:8000/subscriptions \
 ```
 
 ```json
-{"id": "44a79d7077ce", "target_url": "http://localhost:9001/hook", "created_at": "2026-09-17T11:11:24+00:00", "paused": false, "paused_at": null, "rotating": false, "previous_secret_expires_at": null, "state": "closed", "consecutive_failures": 0, "next_probe_at": null, "rate_per_second": null, "burst": null}
+{"id": "44a79d7077ce", "target_url": "http://localhost:9001/hook", "created_at": "2026-09-17T11:11:24+00:00", "paused": false, "paused_at": null, "rotating": false, "previous_secret_expires_at": null, "state": "closed", "consecutive_failures": 0, "next_probe_at": null, "rate_per_second": null, "burst": null, "window_timezone": null, "window_days": null, "window_start": null, "window_end": null}
 ```
 
 ### 2. 提交入站事件（HMAC 保护，POST /ingest）
@@ -306,7 +314,7 @@ curl -s -X POST http://localhost:8000/subscriptions/44a79d7077ce/pause
 ```
 
 ```json
-{"id": "44a79d7077ce", "target_url": "http://localhost:9001/hook", "created_at": "2026-09-17T11:11:24+00:00", "paused": true, "paused_at": "2026-09-18T08:30:00+00:00", "rotating": false, "previous_secret_expires_at": null, "state": "closed", "consecutive_failures": 0, "next_probe_at": null, "rate_per_second": null, "burst": null}
+{"id": "44a79d7077ce", "target_url": "http://localhost:9001/hook", "created_at": "2026-09-17T11:11:24+00:00", "paused": true, "paused_at": "2026-09-18T08:30:00+00:00", "rotating": false, "previous_secret_expires_at": null, "state": "closed", "consecutive_failures": 0, "next_probe_at": null, "rate_per_second": null, "burst": null, "window_timezone": null, "window_days": null, "window_start": null, "window_end": null}
 ```
 
 ```bash
@@ -331,7 +339,7 @@ curl -s -X POST http://localhost:8000/subscriptions/44a79d7077ce/rotate-secret \
 ```
 
 ```json
-{"id": "44a79d7077ce", "target_url": "http://localhost:9001/hook", "created_at": "2026-09-17T11:11:24+00:00", "paused": false, "paused_at": null, "rotating": true, "previous_secret_expires_at": "2026-09-18T10:30:00+00:00", "state": "closed", "consecutive_failures": 0, "next_probe_at": null, "rate_per_second": null, "burst": null}
+{"id": "44a79d7077ce", "target_url": "http://localhost:9001/hook", "created_at": "2026-09-17T11:11:24+00:00", "paused": false, "paused_at": null, "rotating": true, "previous_secret_expires_at": "2026-09-18T10:30:00+00:00", "state": "closed", "consecutive_failures": 0, "next_probe_at": null, "rate_per_second": null, "burst": null, "window_timezone": null, "window_days": null, "window_start": null, "window_end": null}
 ```
 
 行为约定：
@@ -360,7 +368,7 @@ curl -s http://localhost:8000/subscriptions/44a79d7077ce
 ```
 
 ```json
-{"id": "44a79d7077ce", "target_url": "http://localhost:9001/hook", "created_at": "2026-09-17T11:11:24+00:00", "paused": false, "paused_at": null, "rotating": false, "previous_secret_expires_at": null, "state": "open", "consecutive_failures": 5, "next_probe_at": "2026-09-18T09:31:00+00:00", "rate_per_second": 2.0, "burst": 2.0}
+{"id": "44a79d7077ce", "target_url": "http://localhost:9001/hook", "created_at": "2026-09-17T11:11:24+00:00", "paused": false, "paused_at": null, "rotating": false, "previous_secret_expires_at": null, "state": "open", "consecutive_failures": 5, "next_probe_at": "2026-09-18T09:31:00+00:00", "rate_per_second": 2.0, "burst": 2.0, "window_timezone": "Asia/Shanghai", "window_days": [1, 2, 3, 4, 5], "window_start": "09:00", "window_end": "18:00"}
 ```
 
 三个熔断器字段（`GET /subscriptions`、`GET /subscriptions/{id}` 及各订阅写操作响应均包含）：
@@ -592,6 +600,66 @@ curl -s http://localhost:8000/audit/deliveries/12
 
 返回该任务的全部字段与**完整尝试记录**（每次尝试的状态码、错误、起止时间与耗时，按 `attempt_no` 升序）。任务不存在返回 `404`；`task_id` 非整数返回 `422`。
 
+### 12. 订阅投递时段（本地时间窗口）
+
+投递时段把订阅的投递限制在**每周重复的本地时间区间**内：指定 IANA 时区、允许的星期（ISO 8601：1=周一 … 7=周日）与本地起止时间。窗口外该订阅的队首任务不被认领，而是把 `next_attempt_at` 确定性推进到下次开放时刻；工作器随后继续处理其它订阅，单个关闭的窗口不会空占工作器。
+
+```bash
+# 工作日 09:00-18:00（Asia/Shanghai 本地时间）投递，其余时间等待
+curl -s -X PUT http://localhost:8000/subscriptions/44a79d7077ce/delivery-window \
+  -H 'Content-Type: application/json' \
+  -d '{"timezone": "Asia/Shanghai", "days": [1,2,3,4,5], "start": "09:00", "end": "18:00"}'
+```
+
+```json
+{
+  "enabled": true,
+  "timezone": "Asia/Shanghai",
+  "days": [1, 2, 3, 4, 5],
+  "start": "09:00",
+  "end": "18:00",
+  "open_now": false,
+  "next_open_at": "2026-09-21T01:00:00+00:00"
+}
+```
+
+```bash
+# 跨午夜窗口：每天 22:00 到次日 06:00（start > end 即跨午夜）
+curl -s -X PUT http://localhost:8000/subscriptions/44a79d7077ce/delivery-window \
+  -H 'Content-Type: application/json' \
+  -d '{"timezone": "Asia/Shanghai", "days": [1,2,3,4,5,6,7], "start": "22:00", "end": "06:00"}'
+
+# 查询当前配置与实时开放状态（只读，不改库）
+curl -s http://localhost:8000/subscriptions/44a79d7077ce/delivery-window
+
+# 恢复全时段投递
+curl -s -X DELETE http://localhost:8000/subscriptions/44a79d7077ce/delivery-window -o /dev/null -w '%{http_code}\n'
+# 204
+```
+
+请求体与响应字段：
+
+| 字段 | 说明 |
+|------|------|
+| `timezone` | 请求字段：IANA 时区名（如 `Asia/Shanghai`、`America/New_York`、`UTC`），窗口的"本地时间"按此时区解释 |
+| `days` | 请求字段：允许投递的星期，ISO 8601 编号 `1`（周一）～`7`（周日），至少 1 天；自动去重排序 |
+| `start` / `end` | 请求字段：本地起止时间 `HH:MM` 或 `HH:MM:SS`；**左闭右开**（`start` 含、`end` 不含）。`start > end` 表示跨午夜窗口；`start == end` 返回 `422`（要全时段投递请 `DELETE` 窗口） |
+| `enabled` | 响应字段：是否已配置窗口；未配置时为 `false`，其余字段均为 `null` |
+| `open_now` | 响应字段：查询时刻窗口是否开放（按持久化配置与墙钟现算） |
+| `next_open_at` | 响应字段：下次开放时刻（UTC ISO 时间）；窗口当前开放时为 `null` |
+
+行为约定：
+
+- **仅队首认领受窗口约束**：窗口判断发生在认领阶段，且严格有序保证候选任务恒为订阅队首；窗口关闭时队首保持 `pending`，同订阅后续任务本就被有序约束阻塞，不同订阅互不影响、照常并行投递。
+- **窗口外确定性再调度**：队首任务到期但窗口关闭时，任务**不被认领**，其 `next_attempt_at` 在认领的同一数据库临界区内被原子推进到下次开放时刻——该时刻是持久化窗口配置（时区 + 星期 + 起止时间）与墙钟的**纯函数**，任何工作器、任何时刻重算结果都相同，不依赖进程内定时器；被推迟的订阅在同一次认领调用内只重调度一次并被跳过，工作器继续认领其它订阅的到期任务。
+- **跨午夜窗口**：`start > end`（如 `22:00`–`06:00`）表示从当天 `start` 到午夜、再从午夜到次日 `end` 开放；**凌晨段归属于前一天的窗口**——周二 03:00 是否开放取决于周一（窗口开始日）是否在 `days` 中，与周二本身无关。
+- **夏令时跳变**：时区换算经 `zoneinfo`（IANA 数据库）完成。春季拨快导致边界时刻不存在时（如美东 02:30），窗口顺延到首个有效本地时刻开放（02:30 → 03:30）；秋季拨回导致边界时刻出现两次时，取第一次出现。两种取舍都是确定性的，配置不变则调度结果不变。
+- **持久化与重启**：窗口配置（`window_timezone` / `window_days` / `window_start_seconds` / `window_end_seconds`）与被推迟的 `next_attempt_at` 全部持久化在 SQLite 中；重启（含崩溃恢复）后任务仍按持久化的调度时刻等待，**绝不会提前投递**——恢复只把崩溃时 `in_progress` 的任务重置为 `pending`，它们在下一次认领时重新经过窗口判断。
+- **与既有链路叠加**：窗口是认领前的又一道闸门，与暂停、熔断、限流、定时投递、重试完全正交——每次实际认领（含每次退避重试、定时任务到点、half-open 探针）都先过窗口判断；退避落到窗口外的重试会被推迟到下次开放；窗口内认领仍照常消耗令牌、照常计入熔断。
+- **替换与删除**：`PUT` 整体替换窗口配置（四列同事务写入），`DELETE` 清空配置恢复全时段投递（`204`）；二者都**不批量改写**已排定的任务——已按旧窗口推迟的任务在原排定时刻醒来后按新配置重新评估（新窗口若关闭则再次推迟，若开放则正常认领）。重复 `DELETE` 或对未配置窗口的订阅调用返回 `404`。
+- **错误码**：订阅不存在时 `GET`/`PUT`/`DELETE` 均返回 `404`；时区名非法、`days` 为空或越界、时间格式非法、`start == end` 均返回 `422`。
+- **订阅视图**：`GET /subscriptions` 与 `GET /subscriptions/{id}` 的每个订阅都带 `window_timezone` / `window_days` / `window_start` / `window_end`（未配置时为 `null`）；实时开放状态请通过专用 `GET …/delivery-window` 查询。
+
 ### 其他端点
 
 | 方法 | 路径 | 说明 |
@@ -600,14 +668,17 @@ curl -s http://localhost:8000/audit/deliveries/12
 | `POST` | `/events` | 内部提交事件（event_id + payload，无需签名；可选 `deliver_at` 定时投递） |
 | `GET` | `/events/{id}` | 查询事件投递状态（含 `cancelled` / `cancelled_at` / 各状态 `counts`） |
 | `POST` | `/events/{id}/cancel` | 撤销事件未认领的投递任务（原子、幂等，不存在返回 404） |
-| `GET` | `/subscriptions` | 列出全部订阅（含 `paused` / `paused_at`、熔断器字段及 `rate_per_second` / `burst`） |
-| `GET` | `/subscriptions/{id}` | 查询单个订阅（含 `paused` / `paused_at`、熔断器字段及 `rate_per_second` / `burst`） |
+| `GET` | `/subscriptions` | 列出全部订阅（含 `paused` / `paused_at`、熔断器字段、`rate_per_second` / `burst` 及 `window_*` 时段字段） |
+| `GET` | `/subscriptions/{id}` | 查询单个订阅（含 `paused` / `paused_at`、熔断器字段、`rate_per_second` / `burst` 及 `window_*` 时段字段） |
 | `POST` | `/subscriptions/{id}/pause` | 暂停订阅投递（幂等，不存在返回 404） |
 | `POST` | `/subscriptions/{id}/resume` | 恢复订阅投递（幂等，不存在返回 404） |
 | `POST` | `/subscriptions/{id}/rotate-secret` | 轮换签名密钥（宽限期双签；宽限期内重复轮换返回 409，不存在返回 404） |
 | `PUT` | `/subscriptions/{id}/rate-policy` | 设置/替换按订阅令牌桶限流策略（`rate_per_second` + `burst`，桶重置为满，不存在返回 404） |
 | `GET` | `/subscriptions/{id}/rate-policy` | 查询限流策略与实时桶余额、下一令牌时间（未配置时 `enabled=false`） |
 | `DELETE` | `/subscriptions/{id}/rate-policy` | 关闭按订阅限流（清空桶配置，重复删除或未配置返回 404） |
+| `PUT` | `/subscriptions/{id}/delivery-window` | 设置/替换订阅投递时段（IANA 时区 + 允许星期 + 本地起止时间，支持跨午夜，不存在返回 404） |
+| `GET` | `/subscriptions/{id}/delivery-window` | 查询投递时段配置与实时开放状态、下次开放时刻（未配置时 `enabled=false`） |
+| `DELETE` | `/subscriptions/{id}/delivery-window` | 删除投递时段，恢复全时段投递（重复删除或未配置返回 404） |
 | `PUT` | `/subscriptions/{id}/topics` | 替换订阅的去重主题集合（空列表清空，不存在返回 404） |
 | `GET` | `/subscriptions/{id}/topics` | 查询订阅的当前主题集合（排序去重，不存在返回 404） |
 | `POST` | `/topic-events` | 向主题当前全部订阅者发布事件（单事务快照；精确重放返回首次结果，冲突 409，空主题 422） |
@@ -669,6 +740,7 @@ def is_valid_during_rotation(new_secret: str, old_secret: str, body: bytes, head
 - **按订阅令牌桶限流**：`subscriptions` 表新增 `rate_capacity`、`rate_refill_per_second`、`rate_tokens`、`rate_updated_at` 四列（老库由启动迁移自动 `ALTER TABLE` 补齐，存量订阅四列为 `NULL` 即不限流）。令牌补充采用惰性墙钟模型——读取桶时按 `min(capacity, 余额 + (now − updated_at) * rate)` 现算，不需要后台补充协程。令牌的补充、判断、扣减与余额持久化全部内联在认领的同一个 `BEGIN IMMEDIATE` 临界区内，与任务状态翻转、熔断器 half_open 翻转一并提交，因此多工作器（含多进程共享一个 DB 文件）不会重复扣用同一令牌，重启后从持久化的 `rate_tokens`/`rate_updated_at` 继续补充。桶中不足一个整令牌时不领取任务：队首任务保持 `pending`，`next_attempt_at` 被原子改为下一令牌可用时刻 `now + (1 − 余额)/rate`（持久化余额的纯函数，任意工作器重算一致），补充后的余额同事务落库；同一次认领调用会记住已限流的订阅集合（`throttled_sids`），对每个订阅至多重调度一次后跳过并继续寻找其它订阅的任务，既避免无意义地反复推后时间，也保证循环必然终止。由于严格有序约束使候选任务恒为订阅队首，令牌检查只发生在队首，队首等令牌时后续任务本就被 `NOT EXISTS` 阻塞，故限流绝不破坏同订阅有序投递；不同订阅互不影响，被限流期间仍可并行投递。`PUT` 安装/替换策略把余额重置为满（`rate_tokens=capacity, rate_updated_at=now`）但不批量改写任务调度；`DELETE` 清空四列关闭限流；`GET` 的实时余额仅现算展示、不写库。
 - **定时投递**：`POST /events` 的可选 `deliver_at` 在 Pydantic 模型层校验——必须是可解析的 ISO-8601 字符串、带显式时区偏移（拒绝无时区的朴素时间与纯日期）、且严格晚于当前时刻，任何不满足均返回 `422` 且不写库；通过后转换为 UTC epoch 秒。`tasks` 表新增 `deliver_at REAL` 列保存该计划时间（立即投递为 `NULL`），并在建任务时用它初始化 `next_attempt_at`，因此“到点前不认领”无需任何进程内定时器，完全由认领查询既有的 `next_attempt_at <= now` 条件保证，服务重启、崩溃恢复后同样成立。等待中的定时任务状态仍是 `pending`，认领查询既有的按订阅有序 `NOT EXISTS` 条件使其自动阻塞同订阅后续所有任务（包括立即到期的任务），直到定时任务本身进入终态；不同订阅照常并行投递。定时任务到点后的投递、失败退避、撤销、暂停恢复、熔断探针等路径与普通任务完全复用，无需特判。老库迁移：经 `cancelled` 表重建升级的最老库在重建时直接带上 `deliver_at` 列；已有 `cancelled_at` 但缺少该列的较新库通过 `ALTER TABLE tasks ADD COLUMN deliver_at REAL` 补齐，存量任务取值 `NULL`（即立即投递语义）。
 - **事件级撤销**：`tasks.status` 增加终态 `cancelled` 并新增 `cancelled_at` 列（新建库直接具备；老库启动迁移时按 SQLite 官方表重建流程——`foreign_keys=OFF`、单个显式事务内建新表、拷贝数据、DROP、RENAME、重建 `tasks` 上的两个索引——自动升级，既有任务数据原样保留）。`POST /events/{id}/cancel` 调用的 `cancel_event` 在连接锁保护的单个事务中执行：事件不存在直接返回 `None`（API 返回 `404`）；否则一条 `UPDATE ... WHERE event_id=? AND status='pending'` 原子地只撤销尚未认领的任务（写入 `cancelled_at`、清空 `next_attempt_at`/`claimed_by`），`in_progress` 与已结束任务不在 WHERE 命中范围内、结果不变；随后按状态 `GROUP BY` 计数返回。由于认领查询只选 `pending` 且有序约束只盯 `pending`/`in_progress`，撤销行既不会被重试、也不会阻塞同订阅后续任务；撤销从不经过 `finish_attempt`，故完全不触碰熔断器记账。唯一需要修复的边角是 half-open 探针在两次尝试之间回到 `pending` 时被撤销：同一事务内把该订阅熔断器从 `half_open` 转回 `open`、探针立即到期并清空探针归属，使下一个待投递任务成为替代探针，避免订阅永久卡在 half-open。重复撤销时 UPDATE 命中 0 行，响应 `cancelled=0` 且计数稳定，天然幂等；撤销与工作器认领共用同一把连接锁，并发下每个任务只可能“被认领（投递并记账）”或“被撤销”，不会重复领取也不会状态错乱。
+- **按订阅投递时段**：`subscriptions` 表新增 `window_timezone`、`window_days`（JSON 数组，ISO 星期 1–7）、`window_start_seconds`、`window_end_seconds`（本地午夜起秒数）四列（老库由启动迁移自动 `ALTER TABLE` 补齐，存量订阅四列为 `NULL` 即全时段开放）。开放判断与下次开放时刻是持久化配置与墙钟的**纯函数**（`app/window.py`）：开放判断把当前时刻换算到订阅时区后按星期与起止秒数判定，跨午夜窗口（`start > end`）的凌晨段归属于前一天的窗口；下次开放时刻从当前本地日期起逐日扫描（星期集合按周循环，至多 8 天必命中），用「本地午夜 + 起始秒数」的墙钟构造再换算回 UTC，因此夏令时跳变由 zoneinfo 确定性解析（不存在的边界按跳变前偏移顺延到首个有效时刻，歧义边界取第一次出现）。窗口闸门内联在认领的同一个 `BEGIN IMMEDIATE` 临界区内、位于令牌检查之前：窗口关闭时队首任务保持 `pending`，`next_attempt_at` 被原子推进到下次开放时刻并同事务落库，该订阅记入本次调用的 `deferred_sids` 后跳过（与限流共用同一去重集合，保证循环必然终止），工作器继续认领其它订阅；由于推迟后的任务在到点前不再满足 `next_attempt_at <= now`，每个关闭周期只产生一次写入。窗口在每次认领尝试时重新求值，故重试退避、定时任务、half-open 探针、崩溃恢复（`in_progress` 重置为 `pending` 后立即到期）全部自然经过窗口判断，重启后绝不会提前投递。`PUT`/`DELETE` 只改订阅行的四列、从不触碰任务行——已按旧配置推迟的任务在原排定时刻醒来后按新配置重新评估；这与限流策略的「不批量改写调度」语义一致。
 - **退避策略**：第 n 次失败后延迟 `2^(n-1)` 秒（1、2、4），第 4 次失败后任务终止，结果为 `failed`。
 - **投递审计查询**：审计接口是 `tasks` / `attempts` 表的只读视图，不新增任何写入路径，投递行为完全不受影响。列表查询固定按 `(updated_at DESC, id DESC)` 排序并采用键集（keyset）分页：游标是上一页最后一行 `(updated_at, id)` 的 base64url 编码（不透明字符串，客户端只需原样回传），下一页以 `WHERE (updated_at, id) < cursor` 续查，因此无需 OFFSET、翻页成本与页深无关，且同一事务批量更新产生的相同 `updated_at`（如事件级撤销）由 `id` 决胜、不会漏行或重复；每页多取一行判断是否存在下一页，`next_cursor` 为 `null` 即末页。`updated_from` / `updated_to` 在 API 层解析为 UTC epoch 秒（要求显式时区，与 `deliver_at` 的校验风格一致）后作为 `updated_at` 的闭区间下推同一查询；游标解码失败、时间范围非法在进入数据库前即返回 `400`。详情查询按任务 ID 联查 `subscriptions`（LEFT JOIN，订阅已删时 `target_url` 为 `null`）并取出该任务的全部 `attempts` 行。
 - **持久化主题发布**：新增两张表（新建库直接具备；老库由启动时 `CREATE TABLE IF NOT EXISTS` 自动创建，不改动任何旧表）：`subscription_topics(subscription_id, topic, created_at)` 以联合主键保存去重成员关系、按 `topic` 建索引；`topic_events(id, topic, payload, receipt, created_at)` 保存发布记录与首次回执。`PUT /subscriptions/{id}/topics` 在单事务内“全删 + 重写”整个集合（替换语义），`DELETE` 订阅在删除订阅的同一事务中级联清退成员关系。`POST /topic-events` 的 `publish_topic_event` 在连接锁保护的一个 `BEGIN IMMEDIATE` 事务中依次执行：①按 `(event_id, topic, payload)` 查 `topic_events`——三元组全等返回存储回执（`duplicate`），topic 不符返回 `('conflict','topic')`，payload 不符返回 `('conflict','payload')`；②查 `events` 表拦截跨通道 ID 复用（`('conflict','channel')`，`POST /events` 侧用 `topic_event_exists`、`POST /ingest` 侧在 `ingest_event` 内做对称检查，因此跨通道冲突在两个方向上都封死）；③快照 `subscription_topics` 中该主题的成员（按 `created_at, subscription_id` 排序，保证收件顺序确定），为空则直接回滚返回 `empty`——API 映射为 422，且事务未写入任何行；④写 `events`（payload 规范化 JSON 存一份，worker 与 `GET /events` 无需区分来源）、逐成员 `INSERT tasks`（普通 pending 任务，`max_attempts`、退避、有序、令牌桶、熔断全部由既有认领/记账逻辑承载）、写 `topic_events`（含首次回执 JSON）。由于任务是普通任务，有序投递天然成立：同订阅的主题任务与其直接事件任务共用一条 `task_id` 队列。重放只读取首次回执、不碰任务表，所以成员集合事后如何变化都不会增删任务；回执中 `recipients` 的任务状态是首次发布时刻（均为 pending）的存档，实时状态由 `GET /events/{id}` 提供。
@@ -688,6 +760,7 @@ def is_valid_during_rotation(new_secret: str, old_secret: str, body: bytes, head
 | `BREAKER_FAILURE_THRESHOLD` | `5` | 触发订阅熔断的连续最终失败任务数 |
 | `BREAKER_COOLDOWN_SECONDS` | `30` | 熔断冷却时间（到期后放行唯一 half-open 探针） |
 | *按订阅限流* | 未启用（默认不限流） | 限流**不使用环境变量**，逐订阅通过 `PUT /subscriptions/{id}/rate-policy` 配置（`rate_per_second` / `burst`），策略与令牌余额持久化在数据库中 |
+| *按订阅投递时段* | 未启用（默认全时段开放） | 投递时段**不使用环境变量**，逐订阅通过 `PUT /subscriptions/{id}/delivery-window` 配置（`timezone` / `days` / `start` / `end`），配置持久化在数据库中；时区数据来自 IANA 数据库（镜像内置 `tzdata` 包兜底） |
 | `POLL_INTERVAL_SECONDS` | `0.2` | 空闲工作器轮询间隔 |
 
 ## 项目结构
@@ -697,6 +770,7 @@ app/
 ├── main.py      # FastAPI 应用：API 端点 + 生命周期（启动/停止工作器）
 ├── worker.py    # 投递工作器：认领任务、HTTP 投递、记录结果
 ├── db.py        # SQLite 持久层：建表、原子认领、状态更新
+├── window.py    # 投递时段：本地时间窗口的开放判断与下次开放时刻（纯函数）
 ├── schemas.py   # Pydantic 请求/响应模型
 ├── signing.py   # HMAC-SHA256 签名与验签
 └── config.py    # 环境变量配置

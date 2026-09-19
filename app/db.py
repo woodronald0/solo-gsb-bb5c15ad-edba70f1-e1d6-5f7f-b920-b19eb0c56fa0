@@ -13,6 +13,8 @@ import time
 import uuid
 from contextlib import contextmanager
 
+from . import window
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS subscriptions (
     id          TEXT PRIMARY KEY,
@@ -30,7 +32,11 @@ CREATE TABLE IF NOT EXISTS subscriptions (
     rate_capacity          REAL,        -- token-bucket size (max burst); NULL = rate limiting off
     rate_refill_per_second REAL,        -- tokens added per second (sustained delivery rate)
     rate_tokens            REAL,        -- persisted balance; refilled lazily by wall clock
-    rate_updated_at        REAL         -- epoch seconds the balance was last persisted
+    rate_updated_at        REAL,        -- epoch seconds the balance was last persisted
+    window_timezone        TEXT,        -- IANA timezone of the delivery window; NULL = always open
+    window_days            TEXT,        -- JSON array of ISO weekdays (1=Mon..7=Sun) the window applies to
+    window_start_seconds   INTEGER,     -- window start, seconds since local midnight (inclusive)
+    window_end_seconds     INTEGER      -- window end, seconds since local midnight (exclusive)
 );
 
 CREATE TABLE IF NOT EXISTS events (
@@ -102,7 +108,8 @@ CREATE INDEX IF NOT EXISTS idx_subscription_topics_topic ON subscription_topics 
 _SUB_COLUMNS = (
     "id, target_url, created_at, paused_at, previous_secret_expires_at, "
     "breaker_state, breaker_consecutive_failures, breaker_next_probe_at, "
-    "rate_capacity, rate_refill_per_second, rate_tokens, rate_updated_at"
+    "rate_capacity, rate_refill_per_second, rate_tokens, rate_updated_at, "
+    "window_timezone, window_days, window_start_seconds, window_end_seconds"
 )
 
 # Token accounting tolerance; avoids rescheduling by microseconds due to
@@ -227,6 +234,22 @@ class Database:
             self._conn.execute(
                 "ALTER TABLE subscriptions ADD COLUMN rate_updated_at REAL"
             )
+        if "window_timezone" not in cols:
+            self._conn.execute(
+                "ALTER TABLE subscriptions ADD COLUMN window_timezone TEXT"
+            )
+        if "window_days" not in cols:
+            self._conn.execute(
+                "ALTER TABLE subscriptions ADD COLUMN window_days TEXT"
+            )
+        if "window_start_seconds" not in cols:
+            self._conn.execute(
+                "ALTER TABLE subscriptions ADD COLUMN window_start_seconds INTEGER"
+            )
+        if "window_end_seconds" not in cols:
+            self._conn.execute(
+                "ALTER TABLE subscriptions ADD COLUMN window_end_seconds INTEGER"
+            )
 
         task_cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(tasks)")}
         if "cancelled_at" not in task_cols:
@@ -328,6 +351,10 @@ class Database:
             "rate_refill_per_second": None,
             "rate_tokens": None,
             "rate_updated_at": None,
+            "window_timezone": None,
+            "window_days": None,
+            "window_start_seconds": None,
+            "window_end_seconds": None,
         }
 
     def list_subscriptions(self) -> list[dict]:
@@ -514,6 +541,107 @@ class Database:
                       SET rate_capacity = NULL, rate_refill_per_second = NULL,
                           rate_tokens = NULL, rate_updated_at = NULL
                     WHERE id = ? AND rate_capacity IS NOT NULL""",
+                (sub_id,),
+            )
+        return cur.rowcount > 0
+
+    # ------------------------------------------------------------------
+    # per-subscription delivery window (local-time delivery schedule)
+    # ------------------------------------------------------------------
+    def set_delivery_window(
+        self,
+        sub_id: str,
+        timezone_name: str,
+        days: list[int],
+        start_seconds: int,
+        end_seconds: int,
+    ) -> dict | None:
+        """Install/replace a subscription's delivery window, atomically.
+
+        The four window columns are always written together, so readers
+        either see a complete window or none. Existing task schedules are
+        never rewritten: pending tasks run into the new window on their
+        next claim attempt -- a due head task is then claimed (window open)
+        or deferred to the new window's next opening. Returns the updated
+        row, or None when the subscription does not exist.
+        """
+        with self._lock, self._immediate():
+            row = self._conn.execute(
+                "SELECT 1 FROM subscriptions WHERE id = ?", (sub_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            self._conn.execute(
+                """UPDATE subscriptions
+                      SET window_timezone = ?, window_days = ?,
+                          window_start_seconds = ?, window_end_seconds = ?
+                    WHERE id = ?""",
+                (timezone_name, json.dumps(sorted(set(days))), start_seconds, end_seconds, sub_id),
+            )
+            row = self._conn.execute(
+                f"SELECT {_SUB_COLUMNS} FROM subscriptions WHERE id = ?",
+                (sub_id,),
+            ).fetchone()
+        return dict(row)
+
+    def get_delivery_window(self, sub_id: str) -> dict | None:
+        """Return the subscription's delivery window with its live state.
+
+        open_now / next_open_at are pure functions of the persisted config
+        evaluated against the wall clock at query time (read-only; the row
+        is not modified). next_open_at is None while the window is open.
+        Returns None when the subscription does not exist; enabled is False
+        (and the config fields None) when no window is configured.
+        """
+        now = time.time()
+        with self._lock:
+            row = self._conn.execute(
+                f"SELECT {_SUB_COLUMNS} FROM subscriptions WHERE id = ?",
+                (sub_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        sub = dict(row)
+        tz_name = sub["window_timezone"]
+        if tz_name is None:
+            return {
+                "enabled": False,
+                "timezone": None,
+                "days": None,
+                "start_seconds": None,
+                "end_seconds": None,
+                "open_now": None,
+                "next_open_at": None,
+            }
+        days = json.loads(sub["window_days"])
+        start = sub["window_start_seconds"]
+        end = sub["window_end_seconds"]
+        open_now = window.is_open(now, tz_name, days, start, end)
+        return {
+            "enabled": True,
+            "timezone": tz_name,
+            "days": days,
+            "start_seconds": start,
+            "end_seconds": end,
+            "open_now": open_now,
+            "next_open_at": None if open_now else window.next_open(now, tz_name, days, start),
+        }
+
+    def delete_delivery_window(self, sub_id: str) -> bool:
+        """Remove a subscription's delivery window (always-open restored).
+
+        The window columns are cleared; task rows are not touched, so a
+        task previously deferred to a window opening wakes as scheduled (or
+        sooner if another path already moved it) and then claims without
+        any window check. Returns False when the subscription does not
+        exist or has no window configured.
+        """
+        with self._lock, self._immediate():
+            cur = self._conn.execute(
+                """UPDATE subscriptions
+                      SET window_timezone = NULL, window_days = NULL,
+                          window_start_seconds = NULL, window_end_seconds = NULL
+                    WHERE id = ? AND window_timezone IS NOT NULL""",
                 (sub_id,),
             )
         return cur.rowcount > 0
@@ -911,11 +1039,32 @@ class Database:
         the ordering NOT EXISTS anyway, rescheduling it preserves strict
         per-subscription order. The claim loop then looks for due work of
         other subscriptions, so one throttled subscription never parks an
-        idle worker. A subscription found throttled during this call is
-        skipped for the rest of the same call (it is recorded in
-        throttled_sids): its head task was pushed to its refill instant
-        once, and considering it again would only push that instant out
-        further while examining tasks that are blocked behind it anyway.
+        idle worker.
+
+        Per-subscription delivery window: when a subscription has a window
+        (window_timezone set), the candidate head task is claimed only
+        while the window is open at 'now' in the subscription's local
+        timezone. Outside the window the task is NOT claimed: it stays
+        'pending' and its next_attempt_at is pushed to the next window
+        opening, a pure function of the persisted window config and the
+        wall clock (zoneinfo resolves DST, so the instant is identical for
+        every worker and across restarts). The deferral is persisted in
+        this same critical section, the subscription is skipped for the
+        rest of the call, and the loop moves on to other subscriptions, so
+        a closed window never parks an idle worker. The window is
+        re-evaluated on every claim attempt, so retries, scheduled tasks
+        and half-open probes all observe it; installing, replacing or
+        deleting the window never rewrites task rows -- a task deferred by
+        an earlier config simply wakes at its scheduled instant and is
+        re-evaluated against the config in effect then.
+
+        A subscription deferred during this call (throttled or outside its
+        window) is skipped for the rest of the same call (it is recorded
+        in deferred_sids): its head task was pushed to its next eligible
+        instant once, and considering it again would only push that
+        instant out further while examining tasks that are blocked behind
+        it anyway. The membership check also makes the loop provably
+        terminate.
         """
         with self._lock:
             # Take the database-wide write lock up front (BEGIN IMMEDIATE)
@@ -926,17 +1075,20 @@ class Database:
             self._conn.execute("BEGIN IMMEDIATE")
             dirty = False
             try:
-                # Reschedule each throttled subscription at most once per
+                # Reschedule each deferred subscription at most once per
                 # call; the membership check also makes the loop provably
                 # terminate (it never revisits a subscription it deferred).
-                throttled_sids: set[str] = set()
+                deferred_sids: set[str] = set()
                 while True:
-                    skip = ",".join("?" * len(throttled_sids)) if throttled_sids else "SELECT NULL WHERE 0"
+                    skip = ",".join("?" * len(deferred_sids)) if deferred_sids else "SELECT NULL WHERE 0"
                     row = self._conn.execute(
                         f"""SELECT t.*, s.target_url, s.secret, s.previous_secret,
                                   s.previous_secret_expires_at, s.breaker_state,
                                   s.rate_capacity, s.rate_refill_per_second,
-                                  s.rate_tokens, s.rate_updated_at, e.payload
+                                  s.rate_tokens, s.rate_updated_at,
+                                  s.window_timezone, s.window_days,
+                                  s.window_start_seconds, s.window_end_seconds,
+                                  e.payload
                            FROM tasks t
                            LEFT JOIN subscriptions s ON s.id = t.subscription_id
                            LEFT JOIN events e ON e.id = t.event_id
@@ -958,14 +1110,46 @@ class Database:
                                  )
                            ORDER BY t.next_attempt_at, t.id
                            LIMIT 1""",
-                        (now, *throttled_sids, now) if throttled_sids else (now, now),
+                        (now, *deferred_sids, now) if deferred_sids else (now, now),
                     ).fetchone()
                     if row is None:
                         if dirty:
-                            self._conn.commit()  # persist throttled reschedules only
+                            self._conn.commit()  # persist deferred reschedules only
                         else:
                             self._conn.execute("ROLLBACK")  # idle poll: no fsync
                         return None
+
+                    if row["window_timezone"] is not None and row["target_url"] is not None:
+                        # Delivery window: outside the configured local-time
+                        # window the head task stays pending until the next
+                        # opening. That instant is a pure function of the
+                        # persisted window config, so every worker computes
+                        # the same time; it is persisted in this commit.
+                        w_days = json.loads(row["window_days"])
+                        if not window.is_open(
+                            now,
+                            row["window_timezone"],
+                            w_days,
+                            row["window_start_seconds"],
+                            row["window_end_seconds"],
+                        ):
+                            open_at = window.next_open(
+                                now, row["window_timezone"], w_days,
+                                row["window_start_seconds"],
+                            )
+                            self._conn.execute(
+                                """UPDATE tasks
+                                      SET next_attempt_at = ?, updated_at = ?
+                                    WHERE id = ? AND status = 'pending'""",
+                                (open_at, now, row["id"]),
+                            )
+                            # The deferred head task blocks only its own
+                            # subscription; remember it and re-query for work
+                            # of other subscriptions. The reschedule commits
+                            # once the claim transaction leaves the loop.
+                            deferred_sids.add(row["subscription_id"])
+                            dirty = True
+                            continue
 
                     capacity = row["rate_capacity"]
                     refill = row["rate_refill_per_second"]
@@ -998,11 +1182,7 @@ class Database:
                                     WHERE id = ?""",
                                 (balance, now, row["subscription_id"]),
                             )
-                            # The throttled head task blocks only its own
-                            # subscription; remember it and re-query for work of
-                            # other subscriptions. The reschedule commits once
-                            # the claim transaction leaves the loop.
-                            throttled_sids.add(row["subscription_id"])
+                            deferred_sids.add(row["subscription_id"])
                             dirty = True
                             continue
                         # Atomically spend one token together with the claim.

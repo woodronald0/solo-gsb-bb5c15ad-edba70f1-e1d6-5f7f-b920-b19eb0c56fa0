@@ -31,6 +31,14 @@ configured rate. A claim with no whole token available leaves the head
 task pending and reschedules it to the exact computed refill instant,
 inside the same atomic database critical section; bucket state is shared
 by all workers and survives restarts.
+
+A per-subscription delivery window (persisted in the DB) restricts
+claiming to recurring local-time intervals (IANA timezone, ISO weekdays,
+local start/end, possibly crossing midnight). While the window is closed
+the head task stays pending and is rescheduled to the next window opening
+-- a deterministic function of the persisted config, computed inside the
+same atomic claim critical section -- so delivery never happens outside
+the window, even across restarts, and other subscriptions are unaffected.
 """
 from __future__ import annotations
 

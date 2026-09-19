@@ -14,12 +14,14 @@ import httpx
 from fastapi import FastAPI, HTTPException, Query, Request, Response
 from pydantic import ValidationError
 
-from . import config, signing
+from . import config, signing, window
 from .db import Database
 from .schemas import (
     DeliveryStatus,
     DeliveryTaskDetail,
     DeliveryTaskPage,
+    DeliveryWindowCreate,
+    DeliveryWindowOut,
     EventAccepted,
     EventCancelResult,
     EventCreate,
@@ -122,6 +124,18 @@ def _sub_out(sub: dict) -> dict:
         "next_probe_at": _iso(sub["breaker_next_probe_at"]),
         "rate_per_second": sub.get("rate_refill_per_second"),
         "burst": sub.get("rate_capacity"),
+        "window_timezone": sub.get("window_timezone"),
+        "window_days": json.loads(sub["window_days"]) if sub.get("window_days") else None,
+        "window_start": (
+            window.format_time_of_day(sub["window_start_seconds"])
+            if sub.get("window_start_seconds") is not None
+            else None
+        ),
+        "window_end": (
+            window.format_time_of_day(sub["window_end_seconds"])
+            if sub.get("window_end_seconds") is not None
+            else None
+        ),
     }
 
 
@@ -134,6 +148,20 @@ def _rate_policy_out(policy: dict) -> dict:
         "burst": policy["burst"] if enabled else None,
         "tokens_available": round(policy["tokens_available"], 6) if enabled else None,
         "next_token_at": _iso(policy["next_token_at"]),
+    }
+
+
+def _delivery_window_out(win: dict) -> dict:
+    """Serialize a delivery-window row (from db.get_delivery_window)."""
+    enabled = win["enabled"]
+    return {
+        "enabled": enabled,
+        "timezone": win["timezone"] if enabled else None,
+        "days": win["days"] if enabled else None,
+        "start": window.format_time_of_day(win["start_seconds"]) if enabled else None,
+        "end": window.format_time_of_day(win["end_seconds"]) if enabled else None,
+        "open_now": win["open_now"] if enabled else None,
+        "next_open_at": _iso(win["next_open_at"]) if enabled else None,
     }
 
 
@@ -296,6 +324,50 @@ def get_rate_policy(sub_id: str) -> dict:
 def delete_rate_policy(sub_id: str) -> Response:
     """Remove a subscription's rate policy (rate limiting disabled)."""
     if not app.state.db.delete_rate_policy(sub_id):
+        raise HTTPException(404, f"subscription {sub_id!r} not found")
+    return Response(status_code=204)
+
+
+@app.put("/subscriptions/{sub_id}/delivery-window", response_model=DeliveryWindowOut)
+def put_delivery_window(sub_id: str, body: DeliveryWindowCreate) -> dict:
+    """Install or replace a subscription's delivery window.
+
+    The window restricts claiming of the subscription's head task to the
+    configured local-time intervals (IANA timezone, ISO weekdays, local
+    start/end; start > end crosses midnight). While the window is closed
+    the head task stays pending and its next_attempt_at is pushed to the
+    next opening -- a deterministic function of the persisted config, so
+    the schedule survives restarts and never delivers early. Installing or
+    replacing a window never rewrites existing task schedules; tasks are
+    re-evaluated against the new window when they next come due.
+    """
+    start_seconds = window.parse_time_of_day(body.start)
+    end_seconds = window.parse_time_of_day(body.end)
+    sub = app.state.db.set_delivery_window(
+        sub_id, body.timezone, body.days, start_seconds, end_seconds
+    )
+    if sub is None:
+        raise HTTPException(404, f"subscription {sub_id!r} not found")
+    log.info(
+        "subscription %s delivery window set: %s-%s on days %s (%s)",
+        sub_id, body.start, body.end, body.days, body.timezone,
+    )
+    return _delivery_window_out(app.state.db.get_delivery_window(sub_id))
+
+
+@app.get("/subscriptions/{sub_id}/delivery-window", response_model=DeliveryWindowOut)
+def get_delivery_window(sub_id: str) -> dict:
+    """Return the subscription's delivery window and its live open state."""
+    win = app.state.db.get_delivery_window(sub_id)
+    if win is None:
+        raise HTTPException(404, f"subscription {sub_id!r} not found")
+    return _delivery_window_out(win)
+
+
+@app.delete("/subscriptions/{sub_id}/delivery-window", status_code=204)
+def delete_delivery_window(sub_id: str) -> Response:
+    """Remove a subscription's delivery window (always-open delivery)."""
+    if not app.state.db.delete_delivery_window(sub_id):
         raise HTTPException(404, f"subscription {sub_id!r} not found")
     return Response(status_code=204)
 

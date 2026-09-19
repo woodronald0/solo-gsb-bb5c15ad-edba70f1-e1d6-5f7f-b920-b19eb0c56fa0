@@ -4,7 +4,9 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+from . import window
 
 # The five states a delivery task can be in; also the legal values of the
 # status filter on GET /audit/deliveries.
@@ -38,6 +40,11 @@ class SubscriptionOut(BaseModel):
     # Token-bucket rate policy; nulls mean no rate limit is configured.
     rate_per_second: float | None
     burst: float | None
+    # Delivery window; nulls mean no window is configured (always open).
+    window_timezone: str | None
+    window_days: list[int] | None
+    window_start: str | None
+    window_end: str | None
 
 
 class RatePolicyCreate(BaseModel):
@@ -76,6 +83,90 @@ class RatePolicyOut(BaseModel):
     burst: float | None
     tokens_available: float | None
     next_token_at: str | None
+
+
+class DeliveryWindowCreate(BaseModel):
+    """Body of PUT /subscriptions/{id}/delivery-window.
+
+    The window restricts claiming of the subscription's head task to
+    recurring local-time intervals: on the given ISO weekdays (1 = Monday
+    ... 7 = Sunday), between the local times start (inclusive) and end
+    (exclusive) in the given IANA timezone. start > end describes a
+    cross-midnight window (e.g. 22:00-06:00); start == end is rejected
+    (DELETE the window instead for always-open delivery). Installing a
+    window never rewrites existing task schedules; use DELETE to remove it.
+    """
+
+    timezone: str = Field(min_length=1, max_length=64)
+    days: list[int] = Field(min_length=1, max_length=7)
+    start: str = Field(min_length=4, max_length=8)
+    end: str = Field(min_length=4, max_length=8)
+
+    @field_validator("timezone")
+    @classmethod
+    def _valid_timezone(cls, v: str) -> str:
+        v = v.strip()
+        try:
+            window.load_timezone(v)
+        except ValueError:
+            raise ValueError(
+                "timezone must be a valid IANA timezone name, e.g. 'Asia/Shanghai'"
+            ) from None
+        return v
+
+    @field_validator("days", mode="before")
+    @classmethod
+    def _normalize_days(cls, values: Any) -> Any:
+        if not isinstance(values, (list, tuple)):
+            return values  # let pydantic report the type error
+        normalized: list[int] = []
+        for d in values:
+            if isinstance(d, bool) or not isinstance(d, int):
+                raise ValueError(
+                    "days must be ISO weekday integers: 1 (Monday) through 7 (Sunday)"
+                )
+            if not 1 <= d <= 7:
+                raise ValueError(
+                    "days must be ISO weekday integers: 1 (Monday) through 7 (Sunday)"
+                )
+            normalized.append(d)
+        return sorted(set(normalized))
+
+    @field_validator("start", "end")
+    @classmethod
+    def _valid_time_of_day(cls, v: str) -> str:
+        try:
+            window.parse_time_of_day(v)
+        except ValueError:
+            raise ValueError(
+                f"must be a local time 'HH:MM' or 'HH:MM:SS', got {v!r}"
+            ) from None
+        return v.strip()
+
+    @model_validator(mode="after")
+    def _start_differs_from_end(self) -> "DeliveryWindowCreate":
+        if window.parse_time_of_day(self.start) == window.parse_time_of_day(self.end):
+            raise ValueError(
+                "start and end must differ; DELETE the window for always-open delivery"
+            )
+        return self
+
+
+class DeliveryWindowOut(BaseModel):
+    """Response of GET/PUT /subscriptions/{id}/delivery-window.
+
+    enabled is False (and every other field null) when no window is
+    configured. open_now is evaluated at query time; next_open_at is the
+    next instant the window opens (UTC ISO time), null while it is open.
+    """
+
+    enabled: bool
+    timezone: str | None
+    days: list[int] | None
+    start: str | None
+    end: str | None
+    open_now: bool | None
+    next_open_at: str | None
 
 
 class SecretRotationCreate(BaseModel):
